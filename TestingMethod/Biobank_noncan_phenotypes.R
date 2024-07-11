@@ -2,7 +2,11 @@ library(tidyverse)
 library(magrittr)
 library(ukbtools)
 
-my_ukb_data <- ukb_df("ukb677530")
+# select uk biobank version to download by replacing ... with the UK biobank number
+
+ukb_data_file = "ukb..."
+
+my_ukb_data <- ukb_df(ukb_data_file)
 
 qc_info = read_tsv("biobank_general_phenotypes.txt", guess_max =1000000)
 

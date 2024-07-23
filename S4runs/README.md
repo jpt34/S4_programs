@@ -1,1 +1,1 @@
-
+This folder contains example S4 runs, that were used. For a more modern version of S4, it is good to add the flag --approx 0.02 to enable the program to run quicker with little loss of accuracy. The --approz flag sets small diagonal elements to zero in the Cholesky factorisation.  

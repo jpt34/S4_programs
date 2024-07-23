@@ -1,1 +1,1 @@
-
+This folder contains the polygenic models generated using LDpred, S4 and the regression of LDpred on S4. The prefix is {TuningDataset}_{phenotype}_{method}_...gz, where s4ldpred refers to the regression of LDpred on S4. The Schizophrenia (scz) s4ldpred pgm file has been split into two to get the file size below the GitHub limit.

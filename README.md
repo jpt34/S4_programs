@@ -194,7 +194,7 @@ S4_select --functional --ancestry --effect --correct --corrdamp 0.99 \
 * `-n`: N-value from Step 5.
 
 **Note:** 
-* Omit --ancestry and -i flags if your GWAS summary statistics include only one ancestry group.
+* Omit `--ancestry` and `-i` flags if your GWAS summary statistics include only one ancestry group.
 * For multiple ancestry groups, list GWAS summary statistics files in sequence, as shown above.
 
 ### **Step 7. Concatenate SNP Files**

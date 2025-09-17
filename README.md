@@ -128,7 +128,7 @@ Prepare per-chromosome summary statistics with the following **tab-separated col
 7. Odds Ratio
 8. Standard Error
 9. P-value
-10. Functional score *(optional, if using functional annotations)*
+10. Functional score (optional, if using functional annotations)
 
 ```bash
 1:100:C:A	100	A	C	0.183418	0.625168	0.0181689	0.0190609	0.0206728 3.212

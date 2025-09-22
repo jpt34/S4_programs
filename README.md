@@ -332,3 +332,24 @@ chr position COMBINED_rate(cM/Mb) Genetic_Map(cM)
 ```
 * `-i` include files specify individuals/ancestral groups. Omitting this can produce empty outputs.
 * Recommended to test multiple parameter sets (`-p`, `-a`, `-b`, `phi`) and compare results using AUC or chi².
+
+---
+
+## Citation
+
+If you use this repository, please cite the following works:
+
+1. Dareng, E.O., Tyrer, J.P., Barnes, D.R. *et al.*  
+   Polygenic risk modeling for prediction of epithelial ovarian cancer risk.  
+   *European Journal of Human Genetics* 30, 349–362 (2022).  
+   [https://doi.org/10.1038/s41431-021-00987-7](https://doi.org/10.1038/s41431-021-00987-7)
+
+2. Tyrer, J.P., Peng, P.-C., DeVries, A.A. *et al.*  
+   Improving on polygenic scores across complex traits using select and shrink with summary statistics (S4) and LDpred2.  
+   *BMC Genomics* 25, 878 (2024).  
+   [https://doi.org/10.1186/s12864-024-10706-3](https://doi.org/10.1186/s12864-024-10706-3)
+
+3. Baierl, J., Tyrer, J.P., Lai, P.-H. *et al.*  
+   S4-Multi: enhancing polygenic score prediction in ancestrally diverse populations.  
+   *medRxiv* 2025.01.24.25321098 (2025).  
+   [https://doi.org/10.1101/2025.01.24.25321098](https://doi.org/10.1101/2025.01.24.25321098)

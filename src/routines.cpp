@@ -8,6 +8,7 @@
 #include <jlibrary.h>
 #include <zstream.h>
 #include "bgen/parser.hpp"
+#include "bgen/IndexQuery.hpp"
 
 using namespace std;
 namespace bo = boost;
@@ -458,7 +459,7 @@ vector<int> GetCvGroup(const string& inputfile){
 
 // Gets phenotype data from file and put into structure
 
-PhenotypeData GetPhenotypeData(const string& inputfile, const string& group, int cv_group)
+PhenotypeData GetPhenotypeData(const string& inputfile, const string& group)
 {
     ArrayXi status;
 
@@ -481,20 +482,18 @@ PhenotypeData GetPhenotypeData(const string& inputfile, const string& group, int
         phenotypedata.include.resize(regval.size());
     }
 
-    auto cvvec = GetCvGroup(inputfile);
-
     int nvalid = 0;
 
     if(status.size()>0){
         forc(i, status){
-            if(status[i]>=0 && (cvvec.size()!=status.size() || cvvec[i]==cv_group || cv_group==-1)){
+            if(status[i]>=0){
                 ++nvalid;
             }
         }
     }
     else{
         forc(i, regval){
-            if(regval[i]!=-99 && (cvvec.size()!=regval.size() || cvvec[i]==cv_group || cv_group==-1)){
+            if(regval[i]!=-99){
                 ++nvalid;
             }
         }
@@ -526,7 +525,7 @@ PhenotypeData GetPhenotypeData(const string& inputfile, const string& group, int
     if(status.size()>0){
         forc(i, status)
         {
-            if(status[i] >= 0 && (cvvec.size()!=status.size() || cvvec[i]==cv_group || cv_group==-1))
+            if(status[i] >= 0)
             {
                 phenotypedata.include[i] = 1;
 
@@ -547,7 +546,7 @@ PhenotypeData GetPhenotypeData(const string& inputfile, const string& group, int
     else{
         forc(i, regval)
         {
-            if(regval[i] != -99 && (cvvec.size()!=regval.size() || cvvec[i]==cv_group || cv_group==-1))
+            if(regval[i] != -99)
             {
                 phenotypedata.include[i] = 1;
 
@@ -749,7 +748,9 @@ map<double, double> ReadGeneticMap(const string& inputfile)
 
     input >> skipline;
 
-    double f1, f2, f3;
+    string f2;
+
+    double f1, f3;
 
     map<double, double> result;
 
@@ -838,4 +839,948 @@ std::istream& skipdelim(std::istream& is, char c, int numtimes)
     }
 
     return is;
+}
+
+
+map<Posclass, vector<double>> GeneratePRSmap(const string& inputfile)
+{
+    SplitString splitstr;
+
+    zifstream input(inputfile);
+
+    map<Posclass, vector<double>> result;
+
+    vector<double> vec;
+
+    while(input >> splitstr){
+        if(splitstr.size()==7){
+            result[Posclass(splitstr[1]=="X"?23:stoi(splitstr[1]), stoi(splitstr[2]), splitstr[3], splitstr[4])] = {stod(splitstr[5]), stod(splitstr[6])};
+        }
+        else{
+            vec.resize(splitstr.size()-5);
+
+            forc(i,vec){
+                vec[i] = stod(splitstr[i+5]);
+
+                result[Posclass(splitstr[1]=="X"?23:stoi(splitstr[1]), stoi(splitstr[2]), splitstr[3], splitstr[4])] = vec;
+            }
+        }
+    }
+
+    return result;
+}
+
+
+map<Posclass, long> GetPositionsFromIds(vector<string> rsids, const string& ref_file)
+{
+    BgenParser bgenParser(ref_file);
+
+    genfile::bgen::SqliteIndexQuery query(ref_file +".bgi");
+
+    query.include_rsids(rsids);
+
+    query.initialise();
+
+    map<Posclass, long> result;
+
+    for(size_t i=0;i<query.number_of_variants();i++){
+
+        auto fileposition = query.locate_variant(i);
+
+        bgenParser.JumpToPosition(fileposition.first);
+
+        std::string chromosome ;
+        uint32_t position ;
+        std::string rsid ;
+        std::vector< std::string > alleles ;
+        std::vector< std::vector< double > > probs ;
+
+        bgenParser.read_variant( &chromosome, &position, &rsid, &alleles );
+
+        result[Posclass(ConvertChrStr(chromosome), position, alleles[0], alleles[1])] = fileposition.first;
+    }
+
+    return result;
+}
+
+
+// Get SNP statisitics of snps that are in the reference file
+// Column 2 chromosome
+// Column 3 position
+// Column 4 baseline
+// Column 5 effect
+// Column 8 odds ratio
+// Column 9 standard error
+
+vector<SumStatsPRS> GetSelectedSNPstatistics(const map<Posclass, vector<double>>& prsmap, const map<Posclass, long>& position_map, const string& summarystats_file, const string& ref_file, const string& include_file, const string& geneticmap_file)
+{
+    vector<SumStatsPRS> results;
+
+    BgenParser bgenParser(ref_file);
+
+    vector<int> include;
+
+    if(include_file != ""){
+        include = FileRead<vector<int>>(include_file);
+    }
+
+    string origsnpstr, snpstr;
+    SplitStringView splitstr;
+
+    Imputeclass imputeclass;
+
+    struct FlipCheck{
+        string ref;
+        string alt;
+    };
+
+    auto genmap = ReadGeneticMap(geneticmap_file);
+
+    zifstream input(summarystats_file);
+
+    while(input >> splitstr){
+        try {
+            Posclass posclass(ConvertChrStr(string(splitstr[1])), stoi(string(splitstr[2])), splitstr[4], splitstr[3]);
+
+            if(auto itor_prsmap = GetPosItor(prsmap, posclass);itor_prsmap!=prsmap.end()){     // snp found in map
+                if(auto itor2 = GetPosItor(position_map, posclass);itor2!=position_map.end()){
+
+                    bgenParser.JumpToPosition(itor2->second);
+
+                    if(include_file != ""){
+                        bgenParser.ReadImputeclass(imputeclass, include);
+                    }
+                    else{
+                        bgenParser.ReadAllImputeclass(imputeclass);
+                    }
+
+                    if(isfinite(imputeclass.r2) && imputeclass.r2 > 0){
+                        int flip = MatchAlleles(imputeclass, FlipCheck{posclass.ref, posclass.alt});    // are the alleles in the same order as the test statistics
+
+                        double mean = 2.0*imputeclass.eaf;
+
+                        try{
+                            double bvalue = flip * stod(string(splitstr[7]));
+
+                            double svalue = stod(string(splitstr[8]));
+
+                            if(isfinite(bvalue) && isfinite(svalue) && svalue>0){
+                                results.push_back(SumStatsPRS());
+
+                                results.back().w = itor_prsmap->second;
+
+                                results.back().posclass = posclass;
+
+                                results.back().b = bvalue;
+
+                                results.back().s = svalue;
+
+                                results.back().genetic_position = CalcGeneticPosition(genmap, posclass.position);
+
+                                results.back().ref_dosages = VectorXd::Zero(imputeclass.size());
+
+                                forc(i, imputeclass){
+                                    if(imputeclass[i]>-0.5){
+                                        results.back().ref_dosages[i] = imputeclass[i] - mean;
+                                    }
+                                    else{
+                                        results.back().ref_dosages[i]=0;
+                                    }
+                                }
+
+                                results.back().ref_dosages = results.back().ref_dosages/results.back().ref_dosages.norm();
+
+                                int flip2 = MatchAlleles(imputeclass, FlipCheck{itor_prsmap->first.ref, itor_prsmap->first.alt});
+
+                                if(flip2 == -1){
+                                    for(auto& value:results.back().w)
+                                    value *= -1;    // won't matter if frequency as not used here
+                                }
+                            }
+                        }
+                        catch(...){
+                        }
+                    }
+                }
+            }
+        } catch (...) {
+        }
+    }
+
+    return results;
+}
+
+// This estimates the PRS based on the weightings given by the data structure
+// normally only one file is used but this routine was orignally written for several bgen files
+
+VectorXd GetPrincipalComponentValuesFromSeveralBgenFiles(const vector<string>& datafile, map<Posclass, vector<double>>& data, const GenerateParameters& generate_parameters, const string& bgenix_prefix, const vector<string>& chrx_files)
+{
+    string linestr, rsnum;
+
+    Posclass posclass;
+
+    Imputeclass imputeclass;
+
+    vector<string> alleles;
+
+    vector<vector<double>> probs;
+
+    vector<string> rsids=[&]{
+        if(bgenix_prefix!=""){
+            auto unique_ids=ConvertPositionsToIds(bgenix_prefix, data);
+
+            return vector<string>(unique_ids.begin(), unique_ids.end());
+        }
+        else{
+            return vector<string>();
+        }
+    }();
+
+    auto value = rsids.empty() && generate_parameters.use_positions ?
+                    GetPrincipalComponentValuesFromPositions(datafile, data, generate_parameters):
+                    GetPrincipalComponentValuesFromIds(datafile, data, rsids, generate_parameters);
+
+    if(chrx_files.size()==2){
+        auto value2 = rsids.empty() && generate_parameters.use_positions ?
+                        GetPrincipalComponentValuesFromPositions({chrx_files[0]}, data, generate_parameters):
+                        GetPrincipalComponentValuesFromIds({chrx_files[0]}, data, rsids, generate_parameters);
+
+        zifstream input(chrx_files[1]);
+
+        vector<pair<int,int>> conv_indices;
+
+        for(pair<int,int> temppair;input >> temppair;){
+            conv_indices.emplace_back(temppair);
+        }
+
+        if(value.size()==0){
+            int vecsize = max_element(conv_indices.begin(), conv_indices.end())->first + 1;
+            value = VectorXd::Zero(vecsize);
+        }
+
+        for(auto v: conv_indices){
+            if(unsigned(v.first)>=unsigned(value.size()) || unsigned(v.second) >= unsigned(value2.size())){
+                cout << "index out of bounds\n";
+                exit(1);
+            }
+
+            value[v.first] += value2[v.second];
+        }
+    }
+
+    return value;
+}
+
+
+std::vector<std::string> getVariantStrings(
+    const std::map<Posclass, std::vector<double>>& variantMap,
+    int targetChromosome) // e.g., 1 (for chr1)
+{
+    std::vector<std::string> result;
+
+    for (const auto& [posClass, scores] : variantMap) {
+        if (posClass.chr == targetChromosome || targetChromosome <=0) {
+
+             result.push_back(
+                 "chr" + std::to_string(posClass.chr) + ":" +
+                 std::to_string(posClass.position) + ":" +
+                 posClass.ref + ":" +
+                 posClass.alt
+             );
+        }
+    }
+
+    return result;
+}
+
+
+
+// This estimates the PRS based on the weightings given by the data structure
+// normally only one file is used but this routine was orignally written for several bgen files
+
+VectorXd GetPrincipalComponentValuesFromIds(const vector<string>& datafile, map<Posclass, vector<double>>& data, const vector<string>& rsids, const GenerateParameters &generate_parameters)
+{
+    string linestr, rsnum;
+
+    Posclass posclass;
+
+    Imputeclass imputeclass;
+
+    uint32_t position;
+
+    vector<string> alleles;
+
+    vector<vector<double>> probs;
+
+    int nsnps = 0;
+
+    vector<double> prsvec;
+
+    auto group_vec = (generate_parameters.group_file==""?vector<int>():FileRead<vector<int>>(generate_parameters.group_file));
+
+    auto UpdatePRSdosages = [&](BgenParser& bgenparse){
+        tie(imputeclass.ref, imputeclass.alt) = {alleles[0],alleles[1]};
+
+        imputeclass.position = int(position);
+
+        auto itor = data.find(Posclass{imputeclass});
+
+        bool swapped = false;
+
+    // insertion deletions are not mapped if the order is different so check whether this is the case and mark for flipping
+
+    if(itor==data.end() && (imputeclass.ref.size()!=1 || imputeclass.alt.size()!=1)){
+        swap(imputeclass.ref, imputeclass.alt);
+
+        itor = data.find(Posclass{imputeclass});
+
+        swap(imputeclass.ref, imputeclass.alt);
+
+        swapped = true;
+    }
+
+        if(itor != data.end())
+        {
+            //                bgenParser.ReadAllProbs(imputeclass);
+
+            //            bgenparse.read_probs(&probs);
+
+            //            if(prs.size()==0) prs = VectorXd::Zero(probs.size());
+
+            int factor = MatchAlleles(Posclass{imputeclass}, itor->first);
+
+            if(swapped){
+                factor = -1;        // insertion deletion that needs to be flipped
+            }
+
+            if(group_vec.empty()){
+                bgenparse.UpdatePRS(prsvec, factor, itor->second[0], 2*itor->second[1]);
+            }
+            else{
+                bgenparse.UpdatePGSMissingAdjusted(prsvec, group_vec, factor, itor->second[0], 2*itor->second[1]);
+            }
+
+
+
+            //            double value;
+
+            //            forc(i, probs)
+            //            {
+            //                if(probs[i].size()==3)
+            //                {
+            //                    value = 2*probs[i][2]+probs[i][1];
+            //                }
+            //                else if(probs[i].size()==2)
+            //                {
+            //                    value = 2*probs[i][1];
+            //                }
+            //                else
+            //                {
+            //                    value = -1;
+            //                }
+
+            //                if(value >= -1e-9)
+            //                {
+            //                    double meandiff = 2*(factor==-1) + factor*value - 2*itor->second[1];
+
+            //                    prs[i] += meandiff * itor->second[0];
+            //                }
+            //            }
+
+            if(generate_parameters.print){
+                ++nsnps;
+
+                if(nsnps%generate_parameters.print==0){
+                    cout << nsnps << " " << imputeclass.rsnum << '\n';
+                }
+            }
+        }
+        else
+        {
+            bgenparse.ignore_probs();
+        }
+    };
+
+    int chromosome = 0;
+
+    for(auto& v: datafile)
+    {
+        BgenParser bgenParser(v);
+
+        if(!bgenParser.is_bgenformat){
+            cerr << v << " is not in BGEN format\n";
+
+            exit(1);
+        }
+
+        if(!rsids.empty()){
+            genfile::bgen::SqliteIndexQuery query(Paste(v,".bgi"));
+
+            query.include_rsids(rsids);
+
+            query.initialise();
+
+            if(generate_parameters.print) cout << query.number_of_variants() << '\n';
+
+            for(size_t i=0;i<query.number_of_variants();i++){
+
+                auto fileposition = query.locate_variant(i);
+
+                bgenParser.JumpToPosition(fileposition.first);
+
+                bgenParser.read_variant(&imputeclass.chromosome, &position, &imputeclass.rsnum, &alleles);
+
+                UpdatePRSdosages(bgenParser);
+            }
+        }
+        else if(generate_parameters.dragen){
+
+            // Determine chromosome
+            chromosome = (datafile.size() == 22) ? chromosome + 1 : generate_parameters.chromosome;
+
+            set<string> found_snps;
+            vector<string> dragen_ids = getVariantStrings(data, chromosome);
+
+            // Track matches
+            size_t original_matches = 0;
+            size_t swapped_matches = 0;
+            size_t flipped_matches = 0;
+
+            // First pass - original alleles
+            auto first_pass = [&]() {
+                genfile::bgen::SqliteIndexQuery query(Paste(v,".bgi"));
+                query.include_rsids(dragen_ids);
+                query.initialise();
+                original_matches = query.number_of_variants();
+
+                for(size_t i = 0; i < original_matches; i++) {
+                    auto fileposition = query.locate_variant(i);
+                    bgenParser.JumpToPosition(fileposition.first);
+                    bgenParser.read_variant(&imputeclass.chromosome, &position, &imputeclass.rsnum, &alleles);
+                    found_snps.insert(imputeclass.rsnum);
+                    UpdatePRSdosages(bgenParser);
+                }
+            };
+
+            // Lambda to process missing variants with optional flipping
+            auto process_missing_variants = [&](const vector<string>& missing_ids, bool flip_alleles = false) {
+                vector<string> processed_ids;
+                map<string, string> processed_to_original;
+
+                for (const auto& id : missing_ids) {
+                    // Parse the variant ID
+                    vector<string> parts;
+                    size_t start = 0, end = id.find(':');
+                    while (end != string::npos) {
+                        parts.push_back(id.substr(start, end - start));
+                        start = end + 1;
+                        end = id.find(':', start);
+                    }
+                    parts.push_back(id.substr(start));
+
+                    if (parts.size() == 4) {
+                        string ref = parts[2];
+                        string alt = parts[3];
+
+                        string processed_id;
+
+                        if (flip_alleles) {
+                            // Skip A/T and C/G combinations
+                            if (!((ref == "A" && alt == "T") || (ref == "T" && alt == "A") ||
+                                 (ref == "C" && alt == "G") || (ref == "G" && alt == "C"))) {
+                                // Flip the alleles
+                                auto flip = [](const string& a) {
+                                    if (a == "A") return string("T");
+                                    if (a == "T") return string("A");
+                                    if (a == "C") return string("G");
+                                    if (a == "G") return string("C");
+                                    return a;
+                                };
+
+                                processed_id = parts[0] + ":" + parts[1] + ":" + flip(ref) + ":" + flip(alt);
+                                processed_ids.push_back(processed_id);
+                                processed_to_original[processed_id] = id;
+
+                                processed_id = parts[0] + ":" + parts[1] + ":" + flip(alt) + ":" + flip(ref);
+                                processed_ids.push_back(processed_id);
+                                processed_to_original[processed_id] = id;
+                            }
+                        } else {
+                            // Simple swap of ref/alt
+                            processed_id = parts[0] + ":" + parts[1] + ":" + alt + ":" + ref;
+                            processed_ids.push_back(processed_id);
+                            processed_to_original[processed_id] = id;
+                        }
+                    }
+                }
+
+                // Query the processed variants
+                genfile::bgen::SqliteIndexQuery query(Paste(v, ".bgi"));
+                query.include_rsids(processed_ids);
+                query.initialise();
+
+                vector<string> found_variants;
+                for (size_t i = 0; i < query.number_of_variants(); i++) {
+                    auto fileposition = query.locate_variant(i);
+                    bgenParser.JumpToPosition(fileposition.first);
+                    bgenParser.read_variant(&imputeclass.chromosome, &position, &imputeclass.rsnum, &alleles);
+
+                    UpdatePRSdosages(bgenParser);
+                    found_variants.push_back(processed_to_original[imputeclass.rsnum]);
+                }
+
+                return found_variants;
+            };
+
+            // First pass - original alleles
+            first_pass();
+
+            original_matches = found_snps.size();
+
+            vector<string> final_missing;
+
+            // Second pass - swapped alleles for missing variants
+            if (found_snps.size() < dragen_ids.size()) {
+                vector<string> missing_ids;
+                for (const auto& id : dragen_ids) {
+                    if (!found_snps.count(id)) {
+                        missing_ids.push_back(id);
+                    }
+                }
+
+                auto new_found_list = process_missing_variants(missing_ids);
+
+                swapped_matches = new_found_list.size();
+
+                set<string> new_found(new_found_list.begin(), new_found_list.end());
+
+                // Third pass - flipped alleles for still missing variants
+                if (new_found.size() < missing_ids.size()) {
+                    vector<string> still_missing;
+                    for (const auto& id : missing_ids) {
+                        if (!new_found.count(id)) {
+                            still_missing.push_back(id);
+                        }
+                    }
+
+                    auto flipped_found = process_missing_variants(still_missing, true);
+
+                    set<string> new_flipped_found(new_found_list.begin(), new_found_list.end());
+
+                    flipped_matches = flipped_found.size();
+
+                    // Third pass - flipped alleles for still missing variants
+                    if (flipped_found.size() < still_missing.size()) {
+                        for (const auto& id : still_missing) {
+                            if (!new_flipped_found.count(id)) {
+                                final_missing.push_back(id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if(generate_parameters.print) {
+                cout << "Variant matching results:\n"
+                     << "  Original matches: " << original_matches << '\n'
+                     << "  Swapped matches: " << swapped_matches << '\n'
+                     << "  Flipped matches: " << flipped_matches << '\n'
+                     << "  Total snps: " << original_matches+swapped_matches+flipped_matches << "/" << dragen_ids.size() << '\n';
+
+                if(!final_missing.empty())
+                {
+                    cout << "Missing variants\n";
+
+                    for(auto v:final_missing){
+                        cout << v << '\n';
+                    }
+                }
+            }
+        }
+        else{
+            while(bgenParser.read_variant(&imputeclass.chromosome, &position, &imputeclass.rsnum, &alleles))
+            {
+                UpdatePRSdosages(bgenParser);
+            }
+        }
+    }
+
+    VectorXd prs(prsvec.size());
+
+    forc(i, prsvec){
+        prs[i] = prsvec[i];
+    }
+
+    return prs;
+}
+
+
+VectorXd GetPrincipalComponentValuesFromPositions(const vector<string>& datafile, map<Posclass, vector<double>>& data, const GenerateParameters& generate_parameters)
+{
+    string linestr, rsnum;
+
+    Posclass posclass;
+
+    Imputeclass imputeclass;
+
+    uint32_t position;
+
+    vector<string> alleles;
+
+    vector<vector<double>> probs;
+
+    int nsnps = 0;
+
+    vector<double> prsvec;
+
+    auto UpdatePRSdosages = [&](BgenParser& bgenparse){
+        tie(imputeclass.ref, imputeclass.alt) = {alleles[0],alleles[1]};
+
+        imputeclass.position = int(position);
+
+        auto itor = data.find(Posclass{imputeclass});
+
+        bool swapped = false;
+
+        // insertion deletions are not mapped if the order is different so check whether this is the case and mark for flipping
+
+        if(itor==data.end() && (imputeclass.ref.size()!=1 || imputeclass.alt.size()!=1)){
+            swap(imputeclass.ref, imputeclass.alt);
+
+            itor = data.find(Posclass{imputeclass});
+
+            swap(imputeclass.ref, imputeclass.alt);
+
+            swapped = true;
+        }
+
+        if(itor != data.end())
+        {
+            //                bgenParser.ReadAllProbs(imputeclass);
+
+            //            bgenparse.read_probs(&probs);
+
+            //            if(prs.size()==0) prs = VectorXd::Zero(probs.size());
+
+            int factor = MatchAlleles(Posclass{imputeclass}, itor->first);
+
+            if(swapped){
+                factor = -1;        // insertion deletion that needs to be flipped
+            }
+
+            //            bgenparse.ReadAllImputeclassDosages(imputeclass);
+
+            bgenparse.UpdatePRS(prsvec, factor, itor->second[0], 2*itor->second[1]);
+
+            //            forc(i, imputeclass){
+            //                double meandiff = 2*(factor==-1) + factor*imputeclass[i] - 2*itor->second.back();
+
+            //                Map<VectorXd> eigenVector(itor->second.data(), itor->second.size()-1);
+
+            //                prsmat.col(i) += meandiff*eigenVector;
+            ////                forl(j, itor->second.size()-1){
+            ////                    prsmat(j,i) += meandiff * itor->second[j];
+            ////                }
+            //            }
+
+            if(generate_parameters.print){
+                ++nsnps;
+
+                if(nsnps%generate_parameters.print==0){
+                    cout << nsnps << " " << imputeclass.rsnum << '\n';
+                }
+            }
+        }
+        else
+        {
+            bgenparse.ignore_probs();
+        }
+    };
+
+    auto Format_chromosome = [&](int chr) -> std::string {
+        std::string result;
+
+        // Handle special chromosomes (X, Y, M/MT)
+        if (chr == 23 || chr == 24 || chr == 25) {
+            if (generate_parameters.numeric_x) {
+                result = std::to_string(chr);
+            }
+            else{
+                result = "X";
+            }
+        }
+        // Handle regular chromosomes (1-22)
+        else {
+            if (generate_parameters.leading_zero && chr < 10) {
+                result = "0" + std::to_string(chr);
+            } else {
+                result = std::to_string(chr);
+            }
+        }
+
+        // Add 'chr' prefix if needed
+        if (generate_parameters.leading_chr) {
+            result = "chr" + result;
+        }
+
+        return result;
+    };
+
+    forc(i, datafile) {
+        const int chromosome = generate_parameters.chromosome > 0 ? generate_parameters.chromosome : i + 1;
+
+        // First identify all positions we need to query
+        std::vector<std::tuple<std::string, uint32_t>> ranges;
+        for (auto& v : data) {
+            if (v.first.chr == chromosome || (datafile.size() != 22 && generate_parameters.chromosome==0)) {
+                ranges.emplace_back(Format_chromosome(v.first.chr), v.first.position);
+            }
+        }
+
+        const size_t BATCH_SIZE = 900;
+        const size_t total_variants = ranges.size();
+        size_t processed = 0;
+
+        if (generate_parameters.print) {
+            cout << "Total variants to process: " << total_variants << '\n';
+        }
+
+        while (processed < total_variants) {
+            // Create new parser and query for each batch
+            BgenParser bgenParser(datafile[i]);
+            genfile::bgen::SqliteIndexQuery query(Paste(datafile[i], ".bgi"));
+
+            // Add current batch of ranges
+            const size_t batch_end = std::min(processed + BATCH_SIZE, total_variants);
+            for (size_t j = processed; j < batch_end; j++) {
+                query.include_range({get<0>(ranges[j]), get<1>(ranges[j]), get<1>(ranges[j])});
+            }
+
+            query.initialise();
+            const size_t variants_in_batch = query.number_of_variants();
+
+//            if (generate_parameters.print) {
+//                cout << "Processing batch: " << processed << " to " << (processed + variants_in_batch - 1)
+//                     << " (" << variants_in_batch << " variants)" << '\n';
+//            }
+
+            for (size_t j = 0; j < variants_in_batch; j++) {
+                auto fileposition = query.locate_variant(j);
+                bgenParser.JumpToPosition(fileposition.first);
+                bgenParser.read_variant(&imputeclass.chromosome, &position, &imputeclass.rsnum, &alleles);
+                UpdatePRSdosages(bgenParser);
+            }
+
+            processed = batch_end;
+        }
+    }
+
+
+    VectorXd prs(prsvec.size());
+
+    forc(i, prsvec){
+        prs[i] = prsvec[i];
+    }
+
+    return prs;
+}
+
+// Get logistic statistics for calculated PRS values
+
+vector<vector<double>> GetPRSchi2(const PhenotypeData& phenotypedata, const vector<VectorXd>& p)
+{
+    Mlogit logit(phenotypedata, p.size());
+
+    MatrixXd cov(phenotypedata.cov.rows()+p.size(), phenotypedata.cov.cols());
+
+    cov << MatrixXd::Zero(p.size(), phenotypedata.cov.cols()), phenotypedata.cov;
+
+    forc(j, p){
+
+// This checks if the two vectors have the same size. If they don’t, it means there is a mismatch between the weightings file and the phenotype file and the program terminates.
+        if(p[j].size()!=phenotypedata.include.size()){
+            cout << "Size of weightings file is " << p[j].size() << " and of phenotype file is " << phenotypedata.include.size() << "\n";
+
+            exit(1);
+        }
+
+        int count = 0;
+
+        forc(i, phenotypedata.include){
+            if(phenotypedata.include[i]){
+                cov(j, count) = p[j][i];
+                ++count;
+            }
+        }
+    }
+
+    double lik;
+
+    VectorXd x;
+
+    MatrixXd hessian;
+
+    logit.LogitStats(cov, lik, x, hessian);
+
+    vector<vector<double>> result;
+
+    forc(i, p){
+        result.push_back({x[i], sqrt(hessian(i,i)), 2*(lik-logit.liknull)});
+    }
+
+    return result;
+}
+
+
+// Get regression statistics for calculated PRS values
+
+vector<vector<double>> GetRegressionPRS(const PhenotypeData& phenotypedata, const vector<VectorXd>& p)
+{
+    int nstudies = phenotypedata.study.maxCoeff()+1;
+
+    int nparam = phenotypedata.cov.rows() + p.size() + nstudies;
+
+    MatrixXd cov(nparam, phenotypedata.cov.cols());
+
+    cov << MatrixXd::Zero(p.size(),phenotypedata.cov.cols()), MatrixXd::Zero(nstudies, phenotypedata.cov.cols()), phenotypedata.cov;
+
+    forc(j, p){
+
+// This checks if the two vectors have the same size. If they don’t, it means there is a mismatch between the weightings file and the phenotype file and the program terminates.
+        if(p[j].size()!=phenotypedata.include.size()){
+            cout << "Size of weightings file is " << p[j].size() << " and of phenotype file is " << phenotypedata.include.size() << "\n";
+
+            exit(1);
+        }
+
+        int count = 0;
+
+        forc(i, phenotypedata.include){
+            if(phenotypedata.include[i]){
+                cov(j, count) = p[j][i];
+                cov(p.size()+phenotypedata.study[count], count)=1;
+                ++count;
+            }
+        }
+    }
+
+    MatrixXd var = (cov*cov.transpose());
+
+    vector<vector<double>> result;
+
+    if(var.determinant()!=0){
+        var = var.inverse();
+
+        VectorXd c = cov*phenotypedata.regval;
+
+        VectorXd b = var*c;
+
+        double regsum = phenotypedata.regval.squaredNorm();
+
+        double rss = regsum - b.dot(c);
+
+        forc(i, p){
+            double se = sqrt(rss*var(i,i)/(phenotypedata.study.size()-cov.rows()));
+
+            result.push_back({b[i], se, Sqr(b[i]/se)});
+        }
+
+//        VectorXd pred = cov.transpose()*b;
+
+//        double rss = (phenotypedata.regval - pred).squaredNorm();
+
+        int nrowcalc = cov.rows()-p.size();
+
+        MatrixXd covnull = cov.bottomRows(nrowcalc);
+
+        MatrixXd varnull = (covnull*covnull.transpose()).inverse();
+
+        VectorXd cnull = covnull*phenotypedata.regval;
+
+        VectorXd bnull = varnull*cnull;
+
+        double mss = regsum - bnull.dot(cnull);
+
+//        VectorXd pred2 = cov.bottomRows(nrowcalc).transpose()*b.tail(nrowcalc);
+
+//        double mss = (phenotypedata.regval - pred2).squaredNorm();
+
+        double r2 = 1-rss/mss;
+
+        for(auto& v: result){
+            v.push_back(r2);
+        }
+
+        return result;
+    }
+    else{
+        return vector<vector<double>>(p.size(), vector<double>{0.0,0.0,0.0});
+    }
+}
+
+
+// Get stratified area under the curve that takes into account the study groups
+
+double GetStratRankSumStat(const VectorXi& status, const VectorXi& study, const VectorXd& p)
+{
+    map<int, map<double, vector<int>>> rankp;
+
+    forc(i, p)
+    {
+        if(status[i]==0 || status[i]==1) rankp[study[i]][p[i]].push_back(status[i]);
+    }
+
+    double weightsum = 0.0;
+
+    double ustrata_strat = 0.0;
+
+    for(auto& x: rankp)
+    {
+        double ranksum[2] = {0,0};
+
+        int studycounts[2] = {0,0};
+
+        double rankvalue = 0.5;
+
+        for(auto& v: x.second)
+        {
+            for(auto& w: v.second)
+            {
+                ranksum[w] += rankvalue + 0.5*v.second.size();
+
+                ++studycounts[w];
+            }
+
+            rankvalue += v.second.size();
+        }
+
+        double weight = (double(studycounts[0])*studycounts[1])/(studycounts[0]+studycounts[1]+1);
+
+        weightsum += weight;
+
+        if(weight > 0)
+        {
+            ustrata_strat += weight*(ranksum[1] - studycounts[1]*double(studycounts[1]+1)/2.0)/(double(studycounts[0])*studycounts[1]);
+        }
+    }
+
+    ustrata_strat /= weightsum;
+
+    return ustrata_strat;
+}
+
+
+// Get pearson correlation between prs values and outcome
+
+double GetPearsonCorrelation(const VectorXd& regval, const VectorXd& prs)
+{
+    VectorXd regval_std = (regval.array()-regval.mean());
+
+    regval_std /= regval_std.norm();
+
+    VectorXd prs_std = (prs.array()-prs.mean());
+
+    regval_std /= prs_std.norm();
+
+    return regval_std.dot(prs_std);
 }

@@ -16,7 +16,7 @@ using namespace Eigen;
 class Mlogit
 {
 public:
-    Mlogit(const PhenotypeData& covdata);
+    Mlogit(const PhenotypeData& covdata, int nsnps=1);
     void LogitStudyStats(const MatrixXd &cov, VectorXd& x, MatrixXd& hessian) const;
     int nstudies;
     int ngroups;

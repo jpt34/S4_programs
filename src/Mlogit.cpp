@@ -5,13 +5,13 @@
 // This initialises the logit model
 // The null values are calculated so that they can be used as a starting point. The null likelihood is also calculated
 
-Mlogit::Mlogit(const PhenotypeData& covdata)
+Mlogit::Mlogit(const PhenotypeData& covdata, int nsnps)
 {
     phenotypedata = covdata;
 
     nstudies = phenotypedata.study.maxCoeff()+1;
 
-    ngroups = phenotypedata.status.maxCoeff();
+    ngroups = 1;
 
     map<int, int> groups_chosen;
 
@@ -58,38 +58,21 @@ Mlogit::Mlogit(const PhenotypeData& covdata)
 
     liknull = lik;
 
-    xstart.resize(xstartnull.size()+ngroups);
+    xstart.resize(xstartnull.size()+ngroups*nsnps);   // add the number of new elements corresponding to the number of SNPs getting tested
 
-    int j=0;
-
-    if(phenotypedata.cov.rows()==0)
+    forl(i, nsnps)
     {
-        forl(i, ngroups)
-        {
-            xstart[i]=0;
-        }
-
-        forc(i, xstartnull)
-        {
-            xstart[i+ngroups] = xstartnull[i];
-        }
+        xstart[i]=0;
     }
-    else
-    {
-        forc(i, xstartnull)
-        {
-            if(i%phenotypedata.cov.rows()==0 && i/phenotypedata.cov.rows() < ngroups)
-            {
-                xstart[j++]=0;
-            }
 
-            xstart[j++] = xstartnull[i];
-        }
+    forc(i, xstartnull)
+    {
+        xstart[i+nsnps] = xstartnull[i];
     }
 }
 
 
-// This calculates the logistic regrssion for the prs. It doesn't use sse instructions.
+// This calculates the logistic regression for the prs. It doesn't use sse instructions.
 
 void Mlogit::LogitStats(const MatrixXd& cov, double& lik, VectorXd& x, MatrixXd& hessian) const
 {

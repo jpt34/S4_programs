@@ -14,6 +14,10 @@
 #include "bgen/IndexQuery.hpp"
 #include "Mlogit.h"
 #include "routines.h"
+#include "SNPcontributions.h"
+#include "MultiPGS.h"
+#include "PGSregression.h"
+#include "LowSignificanceCorrection.h"
 
 
 using namespace std;
@@ -53,6 +57,37 @@ struct Parameters
     double cojo_threshold;
     bool use_effect_threshold;
     double subset_threshold;
+    string hybrid_file;
+    double hybrid_threshold;
+    int ancestry = 0;
+    vector<double> bounds;
+    double minindr;
+    string excludesnps;
+    double regval = 0.0;
+    bool functional_scores=false;
+
+    double CalcMaxPsi(double zscore) const
+    {
+        if(regval > 1e-10) return 1.0/regval;
+
+        if(bounds.empty()) return 1e50;
+
+        double result = bounds[0];
+
+        for(int i=2;i<int(bounds.size());i+=2){
+            if(abs(zscore) < bounds[i-1]){
+                result = bounds[i];
+                break;
+            }
+        }
+
+        return result;
+    };
+
+    bool IsCojo() const
+    {
+        return (method=="cojo" || method=="reduced");
+    }
 };
 
 
@@ -61,6 +96,7 @@ struct SumStatsParameters
     double genetic_distance;
     double corr_damp;
 };
+
 
 // Get positions in bgen file of SNPs of interest
 
@@ -97,11 +133,52 @@ tuple<map<string, string>, map<Posclass, long>> GetPositions(const string& input
         }
     }
 
+    set<PosclassUnordered> hybrid_snps;
+
+    if(parameters.hybrid_file!=""){
+        zifstream hybrid_input(parameters.hybrid_file);
+
+        SplitString splitstr;
+
+        PosclassUnordered posclass;
+
+        while(hybrid_input >> splitstr){
+            if(splitstr.size()>=5){
+                try {
+                    posclass = PosclassUnordered(ConvertChrStr(splitstr[1]), stoi(splitstr[2]), splitstr[3], splitstr[4]);
+
+                    hybrid_snps.insert(posclass);
+                } catch (...) {
+                    //                    cerr << "Error reading line containing\n" << splitstr.str() << "\n";
+                }
+            }
+        }
+    }
+
     BgenParser bgenParser(inputfile);
 
     map<Posclass,string> snp_list;
 
     set<string> ids_set;
+
+    bool exclude_amb = (string::npos != parameters.excludesnps.find("amb"));
+
+    bool exclude_indel = (string::npos != parameters.excludesnps.find("indel"));
+
+    auto IsAmb = [&](const string& ref, const string& alt){
+        const static std::map<std::string, int> conv{{"A", 1}, {"T",1}, {"C",2}, {"G",2}};
+        try{
+            if(conv.at(ref)==conv.at(alt)){
+                return true;
+            }
+            else{
+                return false;
+            }
+        }
+        catch(...){
+            return false;
+        }
+    };
 
     for(auto v:analysis_files){
         zifstream input(v);
@@ -122,18 +199,39 @@ tuple<map<string, string>, map<Posclass, long>> GetPositions(const string& input
 
                 double threshold = (parameters.method=="cojo"?parameters.cojo_threshold:parameters.threshold);
 
-                if(stold(splitstr[8])< threshold && abs(stod(splitstr[4])-0.5) < 0.5-parameters.maf && stod(splitstr[5])>=parameters.r2impute){
+                int in_hybrid = 0;
+
+                if(parameters.hybrid_file!=""){
+                    in_hybrid = hybrid_snps.count(PosclassUnordered(ConvertChrStr(parameters.chromosome), stoi(splitstr[1]),splitstr[2], splitstr[3]));
+
+//                    if(!in_hybrid && (splitstr[2].size()!=1 || splitstr[3].size()!=1)){
+//                        in_hybrid = hybrid_snps.count(Posclass(ConvertChrStr(parameters.chromosome), stoi(splitstr[1]),splitstr[3], splitstr[2]));
+//                    }
+                }
+
+                bool excludesnp = (exclude_amb && IsAmb(splitstr[2], splitstr[3])) || (exclude_indel && (splitstr[2].size()!=1 || splitstr[3].size()!=1));
+
+                if(((!excludesnp && stold(splitstr[8])< threshold && abs(stod(splitstr[4])-0.5) < 0.5-parameters.maf) || in_hybrid) && stod(splitstr[5])>=parameters.r2impute){
                     double eaf = stod(splitstr[4]);
 
-                    double r2_ss = (parameters.method=="cojo"?1.0:1/(eaf*(1-eaf)*Sqr(stod(splitstr[7]))*parameters.base_num));
+                    double fscore = parameters.functional_scores && splitstr.size()>9?
+                                         stod(splitstr[9]):
+                                         1.0;
 
-                    if(stold(splitstr[8])/r2_ss < threshold){
+                    double r2_ss = fscore*(parameters.IsCojo()?1.0:1/(eaf*(1-eaf)*Sqr(stod(splitstr[7]))*parameters.base_num));
+
+                    if(stold(splitstr[8])/r2_ss < threshold || (in_hybrid && stold(splitstr[8])/r2_ss < parameters.hybrid_threshold)){
                         if(parameters.refsnpfile==""){
                             ids_set.insert(splitstr[0]);
                         }
                         else{
-                            ids_set.insert(snpconv[Posclass(0,stoi(splitstr[1]),splitstr[2], splitstr[3])]);
-                            snp_list[Posclass(0,stoi(splitstr[1]),splitstr[2], splitstr[3])] = splitstr[0];
+                            auto itor_snpconv = GetPosItor(snpconv, Posclass(0,stoi(splitstr[1]),splitstr[2], splitstr[3]));
+
+                            if(itor_snpconv!=snpconv.end()){
+//                                ids_set.insert(snpconv[Posclass(0,stoi(splitstr[1]),splitstr[2], splitstr[3])]);
+                                ids_set.insert(itor_snpconv->second);
+                                snp_list[Posclass(0,stoi(splitstr[1]),splitstr[3], splitstr[2])] = splitstr[0];
+                            }
                         }
                     }
                 }
@@ -141,6 +239,12 @@ tuple<map<string, string>, map<Posclass, long>> GetPositions(const string& input
             catch(...){
                 cerr << "Error reading line containing:\n" << splitstr.str() << "\n";
             }
+        }
+
+// only choose variants for ancestry analysis based on first file
+
+        if(parameters.ancestry){
+            break;
         }
     }
 
@@ -205,7 +309,11 @@ struct SNPdetails
 
     double ref_r2;
 
+    double ss_r2;
+
     long double minpvalue = 1.0;        // minpvalue is long double so as to be able to use very small p values
+
+    double functional_score = 1.0;
 
     vector<tuple<double,double>> stats;     // this contains beta estimates and their standard errors for the SNP.
                                             // It is a vector so that extra histotypes can be analysed.
@@ -233,6 +341,10 @@ struct SNPvector
     VectorXd snpvec;
 };
 
+
+auto First_abs = [](auto x){
+    return abs(get<0>(x[0])/get<1>(x[0]));
+};
 
 auto Max_abs = [](auto x){
     auto v = *max_element(begin(x), end(x),[](auto x, auto y){return abs(get<0>(x)/get<1>(x))<abs(get<0>(y)/get<1>(y));});
@@ -307,7 +419,7 @@ struct SNPgrouping
 
     // calculate conditional statistics based on summary statistics and the correlation matrix
 
-    tuple<vector<tuple<VectorXd,VectorXd>>,MatrixXd, double, double> CalcStats(const SNPdetails& snpdetails, const VectorXd& newcorr, int index) const
+    tuple<vector<tuple<VectorXd,VectorXd>>,MatrixXd, double, double> CalcStats(const SNPdetails& snpdetails, const VectorXd& newcorr, int index, bool use_only_first) const
     {
         MatrixXd z = CalcCorr(newcorr, index);
 
@@ -349,11 +461,15 @@ struct SNPgrouping
 
             forc(j, beta){
                 if((abs(beta[j])-abs(b[j]))/se[j] > maxchange) maxchange = (abs(beta[j])-abs(b[j]))/se[j];
+
+//                if(abs(b[j])>maxchange & b[j]*beta[j] < 0) maxchange = abs(b[j]);
             }
 
             indiv_change = abs(beta[index])-abs(b[index])/se[index];
 
             result.emplace_back(beta, se_result);
+
+            if(use_only_first) break;
         }
 
         return make_tuple(result, z, maxchange, indiv_change);
@@ -362,11 +478,19 @@ struct SNPgrouping
 
     // calculate conditional statistics based on summary statistics and the correlation matrix
 
-    tuple<vector<tuple<VectorXd,VectorXd>>,MatrixXd, double, double> CalcStatsNoVariance(const SNPdetails& snpdetails, const VectorXd& newcorr, int index) const
+    tuple<vector<tuple<VectorXd,VectorXd>>,MatrixXd, double, double> CalcStatsNoVariance(const SNPdetails& snpdetails, const VectorXd& newcorr, int index, const Parameters& parameters) const
     {
         MatrixXd z = CalcCorr(newcorr, index);
 
+        double zstat = get<0>(snpdetails.stats[0])/get<1>(snpdetails.stats[0]);
+
+        z(index, index) = 1.0 + 1.0/parameters.CalcMaxPsi(zstat);
+
         int nrows = newcorr.size() + (index == newcorr.size());
+
+        double r2 = 1/(snpdetails.eaf*(1-snpdetails.eaf)*Sqr(get<1>(snpdetails.stats[0]))*parameters.base_num);
+
+        if(r2 > 1) r2 = 1;
 
         VectorXd b(nrows);
 
@@ -398,11 +522,13 @@ struct SNPgrouping
 
             forc(j, beta){
                 if(abs(beta[j])-abs(zscores[j]) > maxchange) maxchange = (abs(beta[j])-abs(zscores[j]));
+
+//                if(abs(beta[j])>maxchange & zscores[j]*beta[j] < 0) maxchange = abs(beta[j]);
             }
 
-            indiv_change = abs(beta[index])-abs(zscores[index]);
-
             result.emplace_back(beta.cwiseProduct(se), se);
+
+            if(parameters.ancestry) break;  // only analyse the first value if data is from several ancestries
         }
 
         return make_tuple(result, z, maxchange, indiv_change);
@@ -434,12 +560,12 @@ struct SNPgrouping
 
     // calculate conditional statistics based on summary statistics, the correlation matrix and restricting analysis to correlations above subset_threshold
 
-    tuple<vector<tuple<VectorXd,VectorXd>>,MatrixXd, double, double> CalcSubsetStatsNoVariance(const SNPdetails& snpdetails, const VectorXd& newcorr, double subset_threshold) const
+    tuple<vector<tuple<VectorXd,VectorXd>>,MatrixXd, double, double> CalcSubsetStatsNoVariance(const SNPdetails& snpdetails, const VectorXd& newcorr, const Parameters& parameters) const
     {
         vector<int> indices;
 
         forc(i, newcorr){
-            if(abs(newcorr[i]) >= subset_threshold){
+            if(abs(newcorr[i]) >= parameters.subset_threshold){
                 indices.push_back(i);
             }
         }
@@ -491,6 +617,8 @@ struct SNPgrouping
             indiv_change = abs(beta[index])-abs(zscores[index]);
 
             result.emplace_back(beta.cwiseProduct(se), se);
+
+            if(parameters.ancestry) break;
         }
 
         return make_tuple(result, z, maxchange, indiv_change);
@@ -532,13 +660,27 @@ struct SNPgrouping
             }
         }
 
+        double r2 = 1/(v.eaf*(1-v.eaf)*Sqr(get<1>(v.stats[0]))*parameters.base_num);
+
+        if(r2 > 1) r2 = 1;
+
+        bool in_hybrid = parameters.hybrid_file!="" && v.minpvalue/r2 > parameters.threshold;
+
         double r2_min = newcorr.cwiseAbs().maxCoeff();
 
-        double r2_value = ((parameters.use_multiple_r2 && r2_min < parameters.maxr) ? parameters.subset_threshold>0 ? CalculateSubsetR2(newcorr, parameters.subset_threshold)
-                                                                                    : corr_triangular.triangularView<Lower>().solve(newcorr).norm()
-                                                                                    : r2_min); // don't calculate if r2_min is above threshold
+        double r2_value;
 
-//        double r2_compare = CalculateSubsetR2(newcorr, 0.05);
+        if(in_hybrid){
+            r2_value = 0;
+        }
+        else{
+            r2_value = ((parameters.use_multiple_r2 && r2_min < parameters.maxr) ? parameters.subset_threshold>0 ? CalculateSubsetR2(newcorr, parameters.subset_threshold)
+                                                                                        : corr_triangular.triangularView<Lower>().solve(newcorr).norm()
+                                                                                        : r2_min); // don't calculate if r2_min is above threshold
+        }
+
+
+//        double r2_compare = CalculateSubsetR2(newcorr, parameters.subset_threshold);
 
 //        cout << r2_value << ' ' << r2_compare << ' ' << r2_value-r2_compare << '\n';
 
@@ -547,6 +689,24 @@ struct SNPgrouping
 //        }
 
         tuple<vector<tuple<VectorXd,VectorXd>>,MatrixXd,double, double> result;
+
+//        cout << "Test1" << endl;
+
+//        cout << parameters.use_multiple_r2 << endl;
+
+//        cout << (parameters.use_multiple_r2 && r2_min < parameters.maxr) << endl;
+
+//        cout << parameters.subset_threshold << endl;
+
+//        cout << r2_min << endl;
+
+//        cout << corr_triangular.triangularView<Lower>().solve(newcorr).norm() << endl;
+
+//        cout << corr_triangular << endl << endl;
+
+//        cout << newcorr << endl << endl;
+
+//        cout << r2_value << '\t' << corr_triangular.triangularView<Lower>().solve(newcorr).norm() << '\t' << r2_min << '\t' << parameters.maxr << endl;
 
         if(r2_value < parameters.maxr){
 
@@ -560,14 +720,14 @@ struct SNPgrouping
                 return;
             }
 
-            if(parameters.method=="cojo"){
-                result = CalcStats(v, newcorr, newcorr.size());
+            if(parameters.IsCojo()){
+                result = CalcStats(v, newcorr, newcorr.size(), parameters.ancestry);
             }
-            else if(parameters.subset_threshold > 0){
-                result = CalcSubsetStatsNoVariance(v, newcorr, parameters.subset_threshold);
-            }
+//            else if(parameters.subset_threshold > 0){
+//                result = CalcSubsetStatsNoVariance(v, newcorr, parameters.subset_threshold);
+//            }
             else{
-                result = CalcStatsNoVariance(v, newcorr, newcorr.size());
+                result = CalcStatsNoVariance(v, newcorr, newcorr.size(), parameters);
             }
 
             auto [beststat, bestindex] = CalcBestStats(get<0>(result));
@@ -587,23 +747,23 @@ struct SNPgrouping
 
 //            cout << get<2>(result) << '\n';
 
-            if((parameters.method!="cojo" || beststat[newcorr.size()] > zthreshold) && get<2>(result)<parameters.zchange && get<3>(result)<parameters.indiv_change){
+            if((!parameters.IsCojo() || beststat[newcorr.size()] > zthreshold) && get<2>(result)<parameters.zchange && get<3>(result)<parameters.indiv_change){
 //                cout << "Passed " << snps.size() << "\n";
                 snps.push_back({v, temp});
-                if(parameters.subset_threshold>0){
-                    best_statistics = (VectorXd(best_statistics.size()+1) << best_statistics, abs(get<0>(v.stats[0])/ get<1>(v.stats[0]))).finished();
-                    best_index = (VectorXd(best_index.size()+1) << best_index, 1).finished();
-                    corr = (MatrixXd(corr.rows()+1, corr.cols()+1) << corr, newcorr, newcorr.transpose(), 1).finished();
-                    return;
-                }
-                else{
+//                if(parameters.subset_threshold>0){
+//                    best_statistics = (VectorXd(best_statistics.size()+1) << best_statistics, abs(get<0>(v.stats[0])/ get<1>(v.stats[0]))).finished();
+//                    best_index = (VectorXd(best_index.size()+1) << best_index, 1).finished();
+//                    corr = (MatrixXd(corr.rows()+1, corr.cols()+1) << corr, newcorr, newcorr.transpose(), 1).finished();
+//                    return;
+//                }
+//                else{
                     best_statistics = beststat;
                     best_index = bestindex;
                     corr = get<1>(result);
                     LLT<MatrixXd> llt(corr);
                     corr_triangular = llt.matrixL();
                     return;
-                }
+//                }
             }
             else{
 //                cout << "Failed " << snps.size() << "\n";
@@ -637,7 +797,7 @@ struct SNPgrouping
                 }();
 
                 if(r2_value2 < parameters.maxr){
-                    result = CalcStats(v, newcorr, i);
+                    result = CalcStats(v, newcorr, i, parameters.ancestry);
 
                     auto [beststat,bestindex] = CalcBestStats(get<0>(result));
 
@@ -655,9 +815,10 @@ struct SNPgrouping
         }
     }
 
+
     // works out conditional statistics which can be printed if necessary
 
-    vector<tuple<VectorXd,VectorXd>> CalcConditionalStats() const
+    vector<tuple<VectorXd,VectorXd>> CalcConditionalStats(bool use_only_first) const
     {
         int nrows = corr.rows();
 
@@ -685,277 +846,8 @@ struct SNPgrouping
             VectorXd se_result = variance.diagonal().cwiseSqrt();
 
             result.emplace_back(beta, se_result);   // beta is the conditional beta estimates and se_results is the conditional standard error
-        }
 
-        return result;
-    }
-};
-
-
-struct SparseSNPgrouping
-{
-    vector<SNPvector> snps;
-
-    VectorXd best_statistics;
-
-    VectorXd best_index;
-
-    SpMat corr;
-
-    // return correlation matrix when adding a new variable contain correlations between it and the other variables
-
-    SpMat CalcCorr(const VectorXd& newcorr, int index) const
-    {
-        int nrows = newcorr.size() + (index == newcorr.size());
-
-        SpMat z = corr;
-
-        z.conservativeResize(nrows, nrows);
-
-        if(index==newcorr.size()){
-            z.insert(nrows-1,nrows-1) = 1;
-
-            forl(i, nrows-1){
-                if(newcorr[i]!=0){
-                    z.insert(i,nrows-1) = newcorr[i];
-                    z.insert(nrows-1,i) = newcorr[i];
-                }
-            }
-        }else{
-//           z = corr;
-//           forl(i,newcorr.size()-1){
-//               int non_index = i + (i>=index);
-//               z(index, non_index) = z(non_index, index) = newcorr[non_index];
-//           }
-        }
-
-//        cout << z << "\n\n";
-
-        return z;
-    }
-
-    // calculate conditional statistics based on summary statistics and the correlation matrix
-
-    tuple<vector<tuple<VectorXd,VectorXd>>,SpMat, double> CalcStats(const SNPdetails& snpdetails, const VectorXd& newcorr, int index) const
-    {
-        SpMat z = CalcCorr(newcorr, index);
-
-        int nrows = newcorr.size() + (index == newcorr.size());
-
-        VectorXd b(nrows);
-
-        VectorXd se(nrows);
-
-        vector<tuple<VectorXd,VectorXd>> result;
-
-        double maxchange = 0;           // maxchange is the maximum increase in z-score between a condtional statistic over the individual test statistic.
-                                        // If this is above a threshold then the SNP shouldn't be added to the model as something is probably wrong with the correlation structure.
-
-        forl(i, snpdetails.stats.size()){
-            forc(j, newcorr){
-                b[j] = get<0>(snps[j].snpinfo.stats[i]);
-
-                se[j] = get<1>(snps[j].snpinfo.stats[i]);
-            }
-
-            b[index] = get<0>(snpdetails.stats[i]);
-
-            se[index] = get<1>(snpdetails.stats[i]);
-
-            DiagonalMatrix<double,Eigen::Dynamic> semat(se.asDiagonal().inverse());
-
-//            MatrixXd semat = se.asDiagonal().inverse();
-
-            SpMat bmat = semat * z * semat;
-
-            SimplicialLLT<SparseMatrix<double> > solver(bmat);
-
-            SpMat ind(nrows, nrows);
-
-            ind.setIdentity();
-
-            SpMat variance = solver.solve(ind);
-
-//            MatrixXd variance = bmat.inverse();
-
-            VectorXd beta = variance*semat*semat*b;
-
-            VectorXd se_result = variance.diagonal().cwiseSqrt();
-
-            forc(j, beta){
-                if((abs(beta[j])-abs(b[j]))/se[j] > maxchange) maxchange = (abs(beta[j])-abs(b[j]))/se[j];
-            }
-
-//            cout << bmat << "\n\n";
-
-//            cout << variance << "\n\n";
-
-            result.emplace_back(beta, se_result);
-        }
-
-        return make_tuple(result, z, maxchange);
-    }
-
-    // This function adds the SNP into the model if it posses a few tests
-    // there are three methods:
-    // s4 which is the main s4 algorithm to select SNPs to then apply to the shrinkage algorithm
-    // cojo which does a conditional analysis based on the correlation stucture. This is mainly used for finding GWAS significant SNPs.
-    // pca which is to select uncorrelated SNPs for a principal component analysis
-    // zthreshold is only used if a cojo analysis is used.
-
-    void UpdateIfSignificant(const SNPdetails& v, double zthreshold, const VectorXd& temp, const Parameters& parameters)
-    {
-        VectorXd newcorr(corr.rows());
-
-        // ncomp is the expected variance for the test snp compared to what would be the expected variance from the imputed value
-        // this is set to a maximum of one in case the standard error is smaller than what would be expected
-        // ncomp is roughly equivalent to the imputation accuracy.
-
-        double ncomp = min(1.0, 1.0/(v.ref_r2*v.eaf*(1-v.eaf)*Sqr(get<1>(v.stats[0]))*parameters.base_num));
-
-        if(ncomp*v.ref_r2 < parameters.r2impute && parameters.correct_r2) return;
-
-        forc(i,newcorr){
-
-            // ncomp2 is the expected variance for each snp already included
-
-            double ncomp2 = min(1.0, 1.0/(snps[i].snpinfo.ref_r2*snps[i].snpinfo.eaf*(1-snps[i].snpinfo.eaf)*Sqr(get<1>(snps[i].snpinfo.stats[0]))*parameters.base_num));
-
-            // the correlation between the variables is reduced if one is less well imputed than the other
-
-            if(parameters.correct_r2){
-                newcorr[i] = snps[i].snpvec.dot(temp)*sqrt(min(ncomp, ncomp2)/max(ncomp, ncomp2));
-            }
-            else{
-                newcorr[i] = snps[i].snpvec.dot(temp);
-            }
-
-            if(abs(newcorr[i]) < parameters.sparse && abs(v.genpos - snps[i].snpinfo.genpos) >= parameters.maxdistance){
-                newcorr[i] = 0;
-            }
-        }
-
-        SimplicialLLT<SparseMatrix<double> > solver(corr);
-
-        SpMat ind(corr.rows(), corr.rows());
-
-        ind.setIdentity();
-
-        SpMat inv = solver.solve(ind);
-
-        double r2_value = (parameters.use_multiple_r2 ? sqrt(newcorr.transpose()*inv*newcorr) : newcorr.cwiseAbs().maxCoeff());
-
-        tuple<vector<tuple<VectorXd,VectorXd>>,SpMat,double> result;
-
-        if(r2_value < parameters.maxr){
-
-            // if just choosing snps for a principal component analysis then add any snp below a correlation threshold
-
-            if(parameters.method=="pca"){
-                snps.push_back({v, temp});
-                corr = CalcCorr(newcorr, newcorr.size());
-                return;
-            }
-
-            result = CalcStats(v, newcorr, newcorr.size());
-
-            auto [beststat, bestindex] = CalcBestStats(get<0>(result));
-
-            // This is run if the maximum change in the test statisic is below a threshold (suggesting no qc problems)
-            // and the method isn't cojo or the method is cojo and the test statistic is above the threshold.
-
-            if((parameters.method!="cojo" || beststat[newcorr.size()] > zthreshold) && get<2>(result)<parameters.zchange){
-                snps.push_back({v, temp});
-                best_statistics = beststat;
-                best_index = bestindex;
-                corr = get<1>(result);
-                return;
-            }
-        }
-
-        // if the method is cojo then test all statistics where one of the SNPs already in the model is replaced by the tested SNP.
-
-        if(parameters.method=="cojo"){
-            for(int i=newcorr.size()-1;i>=0;i--){
-
-                VectorXd testmax = newcorr;
-
-                testmax[i] = 0;
-
-                double r2_value2 = [&]{
-                    if(parameters.use_multiple_r2){
-                        MatrixXd corr_i = corr;
-
-                        forc(j, newcorr){
-                            corr_i(i,j)=corr_i(j,i) = 0;
-                        }
-
-                        corr_i(i,i) = 1;
-
-                        return sqrt(testmax.transpose()*corr_i.inverse()*testmax);
-                    }
-                    else{
-                        return testmax.cwiseAbs().maxCoeff();
-                    }
-                }();
-
-                if(r2_value2 < parameters.maxr){
-                    result = CalcStats(v, newcorr, i);
-
-                    auto [beststat,bestindex] = CalcBestStats(get<0>(result));
-
-                    if(beststat[i] > best_statistics[i] + 0.5*(i==0 || parameters.method=="sc") && get<2>(result)<parameters.zchange){
-                        snps[i] = SNPvector{v, temp};
-                        best_statistics = beststat;
-                        best_index = bestindex;
-                        corr = get<1>(result);
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    // works out conditional statistics which can be printed if necessary
-
-    vector<tuple<VectorXd,VectorXd>> CalcConditionalStats() const
-    {
-        int nrows = corr.rows();
-
-        VectorXd b(nrows);      // contains the beta estimates
-
-        VectorXd se(nrows);     // contains the standard errors
-
-        vector<tuple<VectorXd,VectorXd>> result;
-
-        forl(i, snps[0].snpinfo.stats.size()){
-            forl(j, nrows){
-                b[j] = get<0>(snps[j].snpinfo.stats[i]);
-
-                se[j] = get<1>(snps[j].snpinfo.stats[i]);
-            }
-
-            DiagonalMatrix<double,Eigen::Dynamic> semat(se.asDiagonal().inverse());
-
-//            MatrixXd semat = se.asDiagonal().inverse();
-
-            SpMat bmat = semat * corr * semat;
-
-            SimplicialLLT<SparseMatrix<double> > solver(bmat);
-
-            SpMat ind(nrows, nrows);
-
-            ind.setIdentity();
-
-            SpMat variance = solver.solve(ind);
-
-//            MatrixXd variance = bmat.inverse();
-
-            VectorXd beta = variance*semat*semat*b;
-
-            VectorXd se_result = variance.diagonal().cwiseSqrt();
-
-            result.emplace_back(beta, se_result);   // beta is the conditional beta estimates and se_results is the conditional standard error
+            if(use_only_first) break;
         }
 
         return result;
@@ -965,7 +857,7 @@ struct SparseSNPgrouping
 
 // Get SNP statisitics of snps that are in the reference file and passed the p-value threshold
 
-map<string, SNPdetails> GetSNPstatistics(const map<string, string>& snpfilepositions, const vector<string>& analysis_files)
+map<string, SNPdetails> GetSNPstatistics(const map<string, string>& snpfilepositions, const vector<string>& analysis_files, const Parameters& parameters)
 {
     map<string, SNPdetails> results;
 
@@ -979,16 +871,38 @@ map<string, SNPdetails> GetSNPstatistics(const map<string, string>& snpfileposit
 
                 input >> remainingline;
 
+                if(remainingline.size()<9){     // check line has enough fields
+                    continue;
+                }
+
                 if(results[origsnpstr].stats.empty()){
                     results[origsnpstr].stats = vector<tuple<double,double>>(analysis_files.size(),{0.0,0.0});
 
                     tie(results[origsnpstr].rsnum, results[origsnpstr].position, results[origsnpstr].effect, results[origsnpstr].baseline, results[origsnpstr].eaf, results[origsnpstr].r2) = make_tuple(snpstr, stoi(remainingline[1]), remainingline[2], remainingline[3],stod(remainingline[4]), stod(remainingline[5]));
                 }
 
-                results[origsnpstr].stats[i] = {stod(remainingline[6]),stod(remainingline[7])};
+                struct TempStr{
+                    string ref;
+                    string alt;
+                };
 
-                if(stold(remainingline[8])< results[origsnpstr].minpvalue){
+                int factor = (remainingline[2] == results[origsnpstr].effect) + (remainingline[3] == results[origsnpstr].baseline) - 1;
+
+                int factor2 = (remainingline[2] == results[origsnpstr].baseline) + (remainingline[3]==results[origsnpstr].effect) - 1;
+
+                if(factor==0 || factor+factor2!=0 || stoi(remainingline[1]) != results[origsnpstr].position){
+                    cerr << "Allele or position mismatch for " << origsnpstr << "\n";
+                    exit(1);
+                }
+
+                results[origsnpstr].stats[i] = {factor*stod(remainingline[6]),stod(remainingline[7])};
+
+                if(stold(remainingline[8])< results[origsnpstr].minpvalue && (i==0 || !parameters.ancestry)){
                     results[origsnpstr].minpvalue = stold(remainingline[8]);
+                }
+
+                if(parameters.functional_scores && remainingline.size()>9){
+                    results[origsnpstr].functional_score = stod(remainingline[9]);
                 }
             }else{
                 input >> skipline;
@@ -1005,14 +919,70 @@ map<string, SNPdetails> GetSNPstatistics(const map<string, string>& snpfileposit
 template<class T>
 decltype(auto) GetPosIterator(const T& snp_positions, const SNPdetails& v)
 {
-    auto p = snp_positions.find(Posclass(ConvertChrStr(v.chromosome), v.position, v.effect, v.baseline));
+    auto p = snp_positions.find(Posclass(ConvertChrStr(v.chromosome), v.position, v.baseline, v.effect));
 
     if(p==snp_positions.end()){
-        p = snp_positions.find(Posclass(ConvertChrStr(v.chromosome), v.position, v.baseline, v.effect));
+        p = snp_positions.find(Posclass(ConvertChrStr(v.chromosome), v.position, v.effect, v.baseline));
     }
 
     return p;
 }
+
+
+// Define a function that takes in an imputed class, residuals, and SNP details
+VectorXd CreateAncestryNormalised(const Imputeclass& imputeclass, const vector<double>& residuals, const SNPdetails& snpdetails)
+{
+    // Declare a map that will store the indices of the input data points that belong to each ancestry class
+    map<int, vector<int>> ancestry_indices;
+
+    // Declare a vector to store the ancestry-normalized values for the input data
+    VectorXd result(imputeclass.size());
+
+    // Loop through each residual value and add its index to the corresponding ancestry class in the map
+    // Also, copy the corresponding imputed class value to the result vector
+    forc(i, residuals){
+        // Round the current residual value to the nearest integer and use the result as the key to access the appropriate ancestry class in the map
+        ancestry_indices[int(residuals[i]+0.5)].push_back(i);
+        // Copy the corresponding imputed class value to the result vector
+        result[i] = imputeclass[i];
+    }
+//{
+//    ofstream output1("test1.txt");
+
+//    output1 << result << '\n';
+//}
+//    cout << result << "\n\n";
+
+    // Loop through each ancestry class (except the first one) and normalize the values in the result vector
+    forv(i, 1, snpdetails.stats.size()){
+        // Subtract the mean of the result values for the current ancestry class from all the values in the result vector for this ancestry class
+        result(ancestry_indices[i]).array() -= result(ancestry_indices[i]).mean();
+        // Calculate the norm of the values in the result vector for this ancestry class
+        double norm = result(ancestry_indices[i]).norm();
+        // Divide the result vector for this ancestry class by the appropriate scaling factor
+
+        if(get<1>(snpdetails.stats[i]) <= 0.0){     // not analysed in dataset
+           result(ancestry_indices[i]) *= 0.0;
+        }
+        else if(norm!=0){                           // if norm is 0 all values are 0 so can't be refactored
+            result(ancestry_indices[i]) /= get<1>(snpdetails.stats[i]) * norm;
+        }
+    }
+
+//    VectorXd test = result.normalized();
+//{
+//    ofstream output2("test2.txt");
+
+//    output2 << result.normalized() << '\n';
+//}
+//    cout << result.normalized() << '\n';
+
+//    exit(0);
+
+    // Return the normalized result vector
+    return result.normalized();
+}
+
 
 // This is the main routine to generate a list of SNPs to analyse
 // It will print out the SNPs in order at which the the top SNP was put into the model
@@ -1025,7 +995,7 @@ void SeveralCorrelatedAnalyses(const string& inputfile, const vector<string>& an
 
     // Get SNP statistics for snps generate by GetPositions routine
 
-    auto snp_statistics = GetSNPstatistics(snp_name_mappings, analysis_files);
+    auto snp_statistics = GetSNPstatistics(snp_name_mappings, analysis_files, parameters);
 
     vector<SNPdetails> sorted_snps(snp_statistics.size());
 
@@ -1043,9 +1013,19 @@ void SeveralCorrelatedAnalyses(const string& inputfile, const vector<string>& an
 
         if(r2_y>1) r2_y = 1;
 
-        if(parameters.method=="cojo") r2_x = r2_y = 1.0;
+        if(parameters.functional_scores){
+            r2_x *= x.functional_score;
+            r2_y *= y.functional_score;
+        }
 
-        return make_pair(-x.minpvalue/r2_x, Max_abs(x.stats)) > make_pair(-y.minpvalue/r2_y, Max_abs(y.stats));
+        if(parameters.IsCojo()) r2_x = r2_y = 1.0;
+
+        if(parameters.ancestry){
+            return make_pair(-x.minpvalue/r2_x, First_abs(x.stats)) > make_pair(-y.minpvalue/r2_y, First_abs(y.stats));
+        }
+        else{
+            return make_pair(-x.minpvalue/r2_x, Max_abs(x.stats)) > make_pair(-y.minpvalue/r2_y, Max_abs(y.stats));
+        }
     });
 
     vector<SNPgrouping> snpgroups;
@@ -1056,7 +1036,7 @@ void SeveralCorrelatedAnalyses(const string& inputfile, const vector<string>& an
 
     boost::math::normal gaussian;
 
-    double zthreshold = -quantile(gaussian, parameters.test_threshold/2);       // zthreshold is only used for a cojo analysis looking for secondary hits that may be at a different significance level than the primary hits
+    double zthreshold = (parameters.test_threshold<=0?-quantile(gaussian, parameters.threshold/2):-quantile(gaussian, parameters.test_threshold/2));       // zthreshold is only used for a cojo analysis looking for secondary hits that may be at a different significance level than the primary hits
 
     struct FlipCheck{
         string ref;
@@ -1115,44 +1095,51 @@ void SeveralCorrelatedAnalyses(const string& inputfile, const vector<string>& an
 
         int flip = MatchAlleles(imputeclass, FlipCheck{v.baseline, v.effect});
 
-        double mean = 2.0*imputeclass.eaf;
+        if(imputeclass.eaf == 0 || imputeclass.eaf==1) continue;     // don't use data if monomorphic in reference file
 
-        if(mean==0 || mean==2) continue;        // don't use data if monomorphic in reference file
-
-        if(residuals_used){
-            mean = 0;
-            double total_weight = 0;
-            forc(i, imputeclass){
-                if(imputeclass[i]>-0.5){
-                    mean += imputeclass[i]*residuals_filtered[i];
-                    total_weight += residuals_filtered[i];
-                }
-            }
-            mean /= total_weight;
-
-            forc(i, temp){
-                if(imputeclass[i]>-0.5){
-                    temp[i] = flip*residuals_filtered[i]*(imputeclass[i] - mean);
-                }
-                else{
-                    temp[i]=0;
-                }
-            }
+        if(parameters.ancestry){            
+            temp = flip * CreateAncestryNormalised(imputeclass, residuals_filtered, v);
         }
         else{
-            forc(i, temp){
-                if(imputeclass[i]>-0.5){
-                    temp[i] = flip*(imputeclass[i] - mean);
+            double mean = 2.0*imputeclass.eaf;
+
+            if(mean==0 || mean==2) continue;        // don't use data if monomorphic in reference file
+
+            if(residuals_used){
+                mean = 0;
+                double total_weight = 0;
+                forc(i, imputeclass){
+                    if(imputeclass[i]>-0.5){
+                        mean += imputeclass[i]*residuals_filtered[i];
+                        total_weight += residuals_filtered[i];
+                    }
                 }
-                else{
-                    temp[i]=0;
+                mean /= total_weight;
+
+                forc(i, temp){
+                    if(imputeclass[i]>-0.5){
+                        temp[i] = flip*residuals_filtered[i]*(imputeclass[i] - mean);
+                    }
+                    else{
+                        temp[i]=0;
+                    }
                 }
             }
+            else{
+                forc(i, temp){
+                    if(imputeclass[i]>-0.5){
+                        temp[i] = flip*(imputeclass[i] - mean);
+                    }
+                    else{
+                        temp[i]=0;
+                    }
+                }
+            }
+
+    //        double sd_val = sqrt(temp.squaredNorm()/temp.size());
+
+            temp /= temp.norm();
         }
-
-//        double sd_val = sqrt(temp.squaredNorm()/temp.size());
-
-        temp /= temp.norm();
 
         v.ref_r2 = imputeclass.r2;      // ref_r2 is the r2 in the reference file rather than the statistics file
 
@@ -1203,7 +1190,11 @@ void SeveralCorrelatedAnalyses(const string& inputfile, const vector<string>& an
 
             double r2 = (distance < parameters.maxdistance ? snpgroups[i].snps[0].snpvec.dot(temp) : 0);    // if distance is greater than max distance assume 0 otherwise calculate correlation
 
-            double effect = abs(r2) * Max_abs(snpgroups[i].snps[0].snpinfo.stats);  // effect of stat on SNP statistic - effect * r2
+            if(parameters.use_effect_threshold && abs(r2) < parameters.minindr){
+                r2 = 0.0;
+            }
+
+            double effect = abs(r2) * (parameters.ancestry ? First_abs(snpgroups[i].snps[0].snpinfo.stats) : Max_abs(snpgroups[i].snps[0].snpinfo.stats));  // effect of stat on SNP statistic - effect * r2
 
             if(abs(r2) > abs(bestr2)){
                 index = i;
@@ -1220,7 +1211,11 @@ void SeveralCorrelatedAnalyses(const string& inputfile, const vector<string>& an
 
                 double r2 = (distance < parameters.maxdistance ? snpgroups[i].snps[j].snpvec.dot(temp) : 0);
 
-                double effect = abs(r2) * Max_abs(snpgroups[i].snps[0].snpinfo.stats);  // effect of stat on SNP statistic - effect * r2
+                if(parameters.use_effect_threshold && abs(r2) < parameters.minindr){
+                    r2 = 0.0;
+                }
+
+                double effect = abs(r2) * (parameters.ancestry ? First_abs(snpgroups[i].snps[0].snpinfo.stats) : Max_abs(snpgroups[i].snps[0].snpinfo.stats));  // effect of stat on SNP statistic - effect * r2
 
                 if(abs(r2) > abs(best_secondary_r2)){
                     secondary_index = i;
@@ -1238,14 +1233,16 @@ void SeveralCorrelatedAnalyses(const string& inputfile, const vector<string>& an
 
             //sets up new group
 
-            if(parameters.method!="cojo" || v.minpvalue < parameters.threshold){
-                auto best_stat = Max_abs(v.stats);
+            if(!parameters.IsCojo() || v.minpvalue < parameters.threshold){
+                auto best_stat = parameters.ancestry ? First_abs(v.stats) : Max_abs(v.stats);
 
-                auto bestindex = Max_index(v.stats);
+                auto bestindex = parameters.ancestry ? 1 : Max_index(v.stats);
 
                 SNPvector snpvec{v, temp};
 
-                MatrixXd corr = MatrixXd::Identity(1,1);
+                double zfactor = 1.0 + 1.0/parameters.CalcMaxPsi(best_stat);
+
+                MatrixXd corr = MatrixXd::Constant(1,1, zfactor);
 
                 snpgroups.push_back(SNPgrouping{{snpvec},VectorXd::Constant(1,best_stat), VectorXd::Constant(1,bestindex), corr, corr});
             }
@@ -1279,231 +1276,54 @@ void SeveralCorrelatedAnalyses(const string& inputfile, const vector<string>& an
                     cout << '\t' << get<0>(w) << '\t' << get<1>(w);
                 }
             }
-            else{
-                Printdelim(cout, '\t', v.snps.size(), i+1, v.snps[i].snpinfo.rsnum, v.best_statistics[i], 2*cdf(gaussian, -v.best_statistics[i]), v.best_index[i], parameters.chromosome, v.snps[i].snpinfo.position, v.snps[i].snpinfo.effect, v.snps[i].snpinfo.baseline, v.snps[i].snpinfo.eaf, v.snps[i].snpinfo.r2);
+            else{                
+               double pvalue;
+
+               try{
+                   pvalue = 2*cdf(gaussian, -v.best_statistics[i]);
+               }
+               catch(...){
+                   pvalue = -1.0;
+               }
+
+                Printdelim(cout, '\t', v.snps.size(), i+1, v.snps[i].snpinfo.rsnum, v.best_statistics[i], pvalue, v.best_index[i], parameters.chromosome, v.snps[i].snpinfo.position, v.snps[i].snpinfo.effect, v.snps[i].snpinfo.baseline, v.snps[i].snpinfo.eaf, v.snps[i].snpinfo.r2);
 
                 for(auto& w:v.snps[i].snpinfo.stats){
                     cout << '\t' << get<0>(w) << '\t' << get<1>(w);
                 }
+
+                if(parameters.functional_scores){
+                    cout << '\t' << v.snps[i].snpinfo.functional_score;
+                }
             }
 
-            if(parameters.method == "cojo"){
-                auto conditional_stats = v.CalcConditionalStats();
+            if(parameters.IsCojo()){
+//                double best_ind_statistic = 0;
+
+//                for(auto& w: v.snps[i].snpinfo.stats){
+//                    if(get<1>(w)>0 && abs(get<0>(w)/get<1>(w))>best_ind_statistic){
+//                        best_ind_statistic = abs(get<0>(w)/get<1>(w));
+//                    }
+//                }
+
+                double best_ind_statistic = parameters.ancestry ? First_abs(v.snps[i].snpinfo.stats) : Max_abs(v.snps[i].snpinfo.stats);
+
+                double pvalue;
+
+                try{
+                    pvalue = 2*cdf(gaussian, -best_ind_statistic);
+                }
+                catch(...){
+                    pvalue = -1.0;
+                }
+
+                cout << '\t' << pvalue;
+
+                auto conditional_stats = v.CalcConditionalStats(parameters.ancestry);
 
                 for(auto& w:conditional_stats){
                     cout << '\t' << get<0>(w)[i] << '\t' << get<1>(w)[i];
                 }
-            }
-
-            cout << '\n';
-        }
-    }
-}
-
-
-void SparseSeveralCorrelatedAnalyses(const string& inputfile, const vector<string>& analysis_files, const Parameters& parameters)
-{
-    // Get SNP names and position in bgen files
-
-    auto [snp_name_mappings, snp_positions] = GetPositions(inputfile, analysis_files, parameters);
-
-    // Get SNP statistics for snps generate by GetPositions routine
-
-    auto snp_statistics = GetSNPstatistics(snp_name_mappings, analysis_files);
-
-    vector<SNPdetails> sorted_snps(snp_statistics.size());
-
-    transform(begin(snp_statistics), end(snp_statistics), begin(sorted_snps), [](auto x){x.second.rsnum=x.first;return x.second;});
-
-    // stable sort is used to make top statistic generation the same no matter the p-value threshold
-    // also use the minimum p-value when the maximum absolute statistics are the same
-
-    stable_sort(begin(sorted_snps), end(sorted_snps), [&](auto& x, auto& y){
-        return make_pair(Max_abs(x.stats), -x.minpvalue) > make_pair(Max_abs(y.stats), -y.minpvalue);
-    });
-
-    vector<SparseSNPgrouping> snpgroups;
-
-    BgenParser bgenParser(inputfile);       // this will read data from the bgen file
-
-    Imputeclass imputeclass;                // this will take data from the bgen file
-
-    boost::math::normal gaussian;
-
-    double zthreshold = -quantile(gaussian, parameters.test_threshold/2);       // zthreshold is only used for a cojo analysis looking for secondary hits that may be at a different significance level than the primary hits
-
-    struct FlipCheck{
-        string ref;
-        string alt;
-    };
-
-    vector<double> residuals = (parameters.includefile==""?vector<double>():FileRead<vector<double>>(parameters.includefile));
-
-    vector<int> include;
-
-    vector<double> residuals_filtered;
-
-    bool residuals_used = false;
-
-    for(auto& v:residuals){
-        include.push_back(double(v!=0));
-
-        if(v!=0){
-            residuals_filtered.push_back(v);
-
-            if(v!=1) residuals_used = true;
-        }
-    }
-
-    VectorXd temp(parameters.includefile==""?bgenParser.number_of_samples():residuals_filtered.size());     // this contains the data from the present SNP that may be added to the snp list
-
-    auto genmap = ReadGeneticMap(parameters.genmapfile);
-
-    for(auto& v:sorted_snps){                                   // cycle through sorted_snps where the most significant value is first
-        // cycle through sorted_snps where the most significant value is first
-        auto p = GetPosIterator(snp_positions, v);
-
-        if(p==snp_positions.end()){
-            continue;
-        }
-
-        bgenParser.JumpToPosition(p->second);
-
-        if(parameters.includefile==""){
-            bgenParser.ReadAllImputeclass(imputeclass);
-        }
-        else{
-            bgenParser.ReadImputeclass(imputeclass, include);
-        }
-
-        int flip = MatchAlleles(imputeclass, FlipCheck{v.baseline, v.effect});
-
-        double mean = 2.0*imputeclass.eaf;
-
-        if(mean==0 || mean==2) continue;        // don't use data if monomorphic in reference file
-
-        if(residuals_used){
-            mean = 0;
-            double total_weight = 0;
-            forc(i, imputeclass){
-                if(imputeclass[i]>-0.5){
-                    mean += imputeclass[i]*residuals_filtered[i];
-                    total_weight += residuals_filtered[i];
-                }
-            }
-            mean /= total_weight;
-
-            forc(i, temp){
-                if(imputeclass[i]>-0.5){
-                    temp[i] = flip*residuals_filtered[i]*(imputeclass[i] - mean);
-                }
-                else{
-                    temp[i]=0;
-                }
-            }
-        }
-        else{
-            forc(i, temp){
-                if(imputeclass[i]>-0.5){
-                    temp[i] = flip*(imputeclass[i] - mean);
-                }
-                else{
-                    temp[i]=0;
-                }
-            }
-        }
-
-        temp /= temp.norm();
-
-        v.ref_r2 = imputeclass.r2;      // ref_r2 is the r2 in the reference file rather than the statistics file
-
-        double r2_estimated_from_stats = 1/(v.eaf*(1-v.eaf)*Sqr(get<1>(v.stats[0]))*parameters.base_num);
-
-        if(r2_estimated_from_stats < parameters.r2impute && parameters.correct_r2) continue;        // ignore if r2 looks too low in summary statistics file
-                                                                                                    // this also include cases when studies are included as the conditional analysis still becomes difficult
-
-        double bestr2 = 0;
-        double best_secondary_r2 = 0;
-        int index = -1;
-        int secondary_index = 0;
-
-        v.genpos = CalcGeneticPosition(genmap, v.position);
-
-        forc(i, snpgroups){
-            double distance = abs(snpgroups[i].snps[0].snpinfo.genpos - v.genpos);
-
-            double r2 = (distance < parameters.maxdistance ? snpgroups[i].snps[0].snpvec.dot(temp) : 0);    // if distance is greater than max distance assume 0 otherwise calculate correlation
-
-            if(abs(r2) > abs(bestr2)){
-                index = i;
-                bestr2 = r2;
-            }
-
-            forv(j, 1, snpgroups[i].snps.size()){
-                double distance2 = abs(snpgroups[i].snps[j].snpinfo.genpos - v.genpos);
-
-                double r2 = (distance2 < parameters.maxdistance ? snpgroups[i].snps[j].snpvec.dot(temp) : 0);
-
-                if(abs(r2) > abs(best_secondary_r2)){
-                    secondary_index = i;
-                    best_secondary_r2 = r2;
-                }
-            }
-        }
-
-        if(abs(bestr2)< parameters.minr && abs(best_secondary_r2) < parameters.minr){   // test whether to start new group
-
-            //sets up new group
-
-            auto best_stat = Max_abs(v.stats);
-
-            auto bestindex = Max_index(v.stats);
-
-            SNPvector snpvec{v, temp};
-
-            SpMat corr(1,1);
-
-            corr.insert(0,0) =1;
-
-//            MatrixXd corr = MatrixXd::Identity(1,1);
-
-            snpgroups.push_back(SparseSNPgrouping{{snpvec},VectorXd::Constant(1,best_stat), VectorXd::Constant(1,bestindex), corr});
-        }
-        else{
-            // test whether to add to existing group and choose index based on best r2
-
-            if(abs(best_secondary_r2) <= abs(bestr2)){
-                snpgroups[index].UpdateIfSignificant(v, zthreshold, temp, parameters);
-            }
-            else{
-                snpgroups[secondary_index].UpdateIfSignificant(v, zthreshold, temp, parameters);
-            }
-        }
-    }
-
-    // print out selected SNPs and their statistics
-
-    for(auto& v:snpgroups){
-
-        auto conditional_stats = v.CalcConditionalStats();
-
-        forc(i, v.snps){
-
-            if(parameters.method=="pca"){
-                Printdelim(cout, '\t', v.snps.size(), i+1, v.snps[i].snpinfo.rsnum, 0, 1, 0, parameters.chromosome, v.snps[i].snpinfo.position, v.snps[i].snpinfo.effect, v.snps[i].snpinfo.baseline, v.snps[i].snpinfo.eaf, v.snps[i].snpinfo.r2);
-
-                cout << "\t0\t10";
-            }
-            else{
-                Printdelim(cout, '\t', v.snps.size(), i+1, v.snps[i].snpinfo.rsnum, v.best_statistics[i], 2*cdf(gaussian, -v.best_statistics[i]), v.best_index[i], parameters.chromosome, v.snps[i].snpinfo.position, v.snps[i].snpinfo.effect, v.snps[i].snpinfo.baseline, v.snps[i].snpinfo.eaf, v.snps[i].snpinfo.r2);
-
-                for(auto& w:v.snps[i].snpinfo.stats){
-                    cout << '\t' << get<0>(w) << '\t' << get<1>(w);
-                }
-
-    //            for(auto& w:conditional_stats){
-    //                cout << '\t' << get<0>(w)[i] << '\t' << get<1>(w)[i];
-    //            }
             }
 
             cout << '\n';
@@ -1518,13 +1338,15 @@ int CL_CondAnalysis(int argc, char* argv[])
 {
     vector<string> inputfiles;
 
-    string datafile, chromosome, includefile="", method="s4", refsnpfile, genmapfile="";
+    string datafile, chromosome, includefile="", method="s4", refsnpfile="", genmapfile="";
 
     // test_threshold is only used in a cojo analysis and is the threshold for secondary hits
 
-    double maf = 0, threshold = 1.0e-5, test_threshold = 1.0e-4, cojo_threshold = 1.0e-3, minr = 0.02, maxdistance = 1e7, maxr = sqrt(0.6), r2impute=0.5;
+    double maf = 0, threshold = 1.0e-5, test_threshold = -1.0, cojo_threshold = 1.0e-3, minr = 0.02, maxdistance = 1e7, maxr = sqrt(0.6), r2impute=0.5;
 
-    bool correctvalue = false, use_multiple_r2;
+    bool correctvalue = false;
+
+    int use_multiple_r2 = -1;
 
     double nvalue=0, zchange = 100, indiv_change = 100;
 
@@ -1540,7 +1362,23 @@ int CL_CondAnalysis(int argc, char* argv[])
 
     double subset_threshold = -1.0;
 
+    string hybrid_file = "";
+
+    double hybrid_threshold = -1;
+
+    double minindr = 0.005;
+
     vector<double> qc;
+
+    bool ancestry = false;
+
+    vector<double> bounds;
+
+    string excludesnps;
+
+    double regval = 0.0;
+
+    bool functional_scores = false;
 
     try
     {
@@ -1559,7 +1397,7 @@ int CL_CondAnalysis(int argc, char* argv[])
                 (",d", po::value<string>(&datafile)->required(), "data file")
                 ("correct,", po::value<bool>(&correctvalue)->zero_tokens(), "correct r2 based on variance of statistic")
                 (",n", po::value<double>(&nvalue), "average number value")
-                ("multiple,", po::value<bool>(&use_multiple_r2)->zero_tokens(), "use multiple r2 as threshold for adding to group")
+                ("multiple,", po::value<int>(&use_multiple_r2), "use multiple r2 if set to 1 (default 0 if method S4, 1 otherwise)")
                 (",z", po::value<double>(&zchange), "maximum increase in absolute z score")
                 (",i", po::value<string>(&includefile), "include samples from ld file")
                 ("method,", po::value<string>(&method), "method for adding SNPs to model, default is for for S4 selection, alternatives are cojo and pca")
@@ -1573,7 +1411,15 @@ int CL_CondAnalysis(int argc, char* argv[])
                 ("zindiv,", po::value<double>(&indiv_change), "maximum increase in absolute z score for specific snp added")
                 ("cojothres,", po::value<double>(&cojo_threshold), "threshold for considering snp in a COJO analysis")
                 ("effect,", po::value<bool>(&use_effect_threshold)->zero_tokens(), "test for change in z-score for significant SNPs")
-                ("subset,", po::value<double>(&subset_threshold), "subset threshold to test for multiple correlation and z-score increase");
+                ("subset,", po::value<double>(&subset_threshold), "subset threshold to test for multiple correlation and z-score increase")
+                ("hybrid_file,", po::value<string>(&hybrid_file), "hybrid file containing variants to prefer")
+                ("hybrid_threshold,", po::value<double>(&hybrid_threshold), "Choose variants in hybrid file below threshold")
+                ("ancestry,", po::value<bool>(&ancestry)->zero_tokens(), "Data is based on multiple ancestries")
+                ("psibounds,", po::value<vector<double>>(&bounds)->multitoken(), "Psi bounds for different zscores")
+                ("minindr,", po::value<double>(&minindr), "minimum individual correlation to put into correlated group when using effect (default 0.005)")
+                ("excludesnps,", po::value<string>(&excludesnps), "amb to exlude ambiguous, indel to exlude indels and ambindel or indelamb to exclude both")
+                ("reg,", po::value<double>(&regval), "regularisation value")
+                ("functional,", po::value<bool>(&functional_scores)->zero_tokens(), "use functional scores");
 
         po::variables_map vm;
 
@@ -1595,52 +1441,75 @@ int CL_CondAnalysis(int argc, char* argv[])
         return -1;
     }
 
+    if(use_multiple_r2==-1){
+        if(method=="s4"){
+            use_multiple_r2 = 0;
+        }
+        else{
+            use_multiple_r2 = 1;
+        }
+    }
+
     // select SNPs and get statistics using the parameters specified from the command line
 
-    SeveralCorrelatedAnalyses(datafile, inputfiles, {maf, threshold, test_threshold, minr, maxr, maxdistance, r2impute, chromosome, correctvalue, nvalue, use_multiple_r2, zchange, includefile, method, refsnpfile, genmapfile, 10, max_individual_r, novarqc, corr_damp, logresults, qc, indiv_change, cojo_threshold, use_effect_threshold, subset_threshold});
+    SeveralCorrelatedAnalyses(datafile, inputfiles, {maf, threshold, test_threshold, minr, maxr, maxdistance, r2impute, chromosome, correctvalue, nvalue, bool(use_multiple_r2), zchange, includefile, method, refsnpfile, genmapfile, 10, max_individual_r, novarqc, corr_damp, logresults, qc, indiv_change, cojo_threshold, use_effect_threshold, subset_threshold, hybrid_file, hybrid_threshold, ancestry, bounds, minindr, excludesnps, regval, functional_scores});
 
     return 0;
 }
 
 
-int CL_SparseCondAnalysis(int argc, char* argv[])
+// This is the command line routine to select SNPs and get their statistics
+
+int CL_SelectedLS(int argc, char* argv[])
 {
     vector<string> inputfiles;
 
-    string datafile, chromosome, includefile="", method="s4", refsnpfile, genmapfile="";
+    string datafile, chromosome, includefile="", method="s4", refsnpfile="", genmapfile="";
 
     // test_threshold is only used in a cojo analysis and is the threshold for secondary hits
 
-    double maf = 0, threshold = 1.0e-5, test_threshold = 1.0e-4, minr = 0.02, maxdistance = 1e7, maxr = sqrt(0.6), r2impute=0.5, sparse = 10;
+    double threshold = 1.0e-5, maxr = sqrt(0.6), r2impute=0.5;
 
-    bool correctvalue = false, use_multiple_r2;
+    bool correctvalue = false;
 
-    double nvalue=0, zchange = 100;
+    double nvalue=0;
+
+    string hybrid_file = "";
+
+    vector<double> qc;
+
+    bool ancestry = false;
+
+    string summarystats_file, pgm_file, bgen_reffile_prefix, bgenixreffile_prefix, include_file, geneticmap_file;
+
+    double genetic_distance = 3.0;
+
+    string outputprefix;
+
+    bool uncorrected;
 
     try
     {
         po::options_description desc;       // this is a boost command line variable that specifies how the variables are read from the command line
 
         desc.add_options()("help,h", "produce help message")
-                (",a", po::value<vector<string>>(&inputfiles)->multitoken(), "analysis files")
-                (",c", po::value<string>(&chromosome)->required(), "chromosome")
-                (",m", po::value<double>(&maf), "minimum MAF")
                 (",p", po::value<double>(&threshold), "p value threshold")
-                (",t", po::value<double>(&test_threshold), "threshold for testing snp")
-                (",r", po::value<double>(&minr), "threshold for putting into correlated group")
+                (",r", po::value<double>(&maxr), "threshold for correlation between existing variants")
                 ("r2impute,", po::value<double>(&r2impute), "imputation threshold for including snp")
-                ("maxr,", po::value<double>(&maxr), "threshold for maximum absolute r to consider")
-                ("dist,", po::value<double>(&maxdistance), "max distance to consider being in same correlated group")
-                (",d", po::value<string>(&datafile)->required(), "data file")
+                ("dist,", po::value<double>(&genetic_distance), "maximum genetic distance to consider as uncorrelated")
+                (",d", po::value<string>(&bgen_reffile_prefix)->required(), "data file")
                 ("correct,", po::value<bool>(&correctvalue)->zero_tokens(), "correct r2 based on variance of statistic")
                 (",n", po::value<double>(&nvalue), "average number value")
-                ("multiple,", po::value<bool>(&use_multiple_r2)->zero_tokens(), "use multiple r2 as threshold for adding to group")
-                (",z", po::value<double>(&zchange), "maximum increase in absolute z score")
-                (",i", po::value<string>(&includefile), "include samples from ld file")
-                ("method,", po::value<string>(&method), "method for adding SNPs to model")
-                ("refsnpfile,", po::value<string>(&refsnpfile), "file containing the SNP positions in the reference file")
-                ("genmapfile,", po::value<string>(&genmapfile), "use specified genetic map file for distance rather than position")
-                ("sparse,", po::value<double>(&sparse), "values for which correlation is set to be 0");
+                (",i", po::value<string>(&include_file), "include samples from ld file")
+                ("refsnpfile,", po::value<string>(&bgenixreffile_prefix), "file containing the SNP positions in the reference file")
+                ("genmapfile,", po::value<string>(&geneticmap_file), "use specified genetic map file for distance rather than position")
+                ("hybridfile,", po::value<string>(&hybrid_file), "hybrid file containing variants to prefer")
+                ("ancestry,", po::value<bool>(&ancestry)->zero_tokens(), "Data is based on multiple ancestries")
+                (",o", po::value<string>(&outputprefix)->required(), "output prefix")
+                (",s", po::value<string>(&summarystats_file)->required(), "summary stats files")
+                ("pgm,", po::value<string>(&pgm_file)->required(), "pgm file")
+                ("uncorrected,", po::value<bool>(&uncorrected)->zero_tokens(), "Get the uncorrected results, rather than the corrected")
+                ;
 
         po::variables_map vm;
 
@@ -1664,7 +1533,7 @@ int CL_SparseCondAnalysis(int argc, char* argv[])
 
     // select SNPs and get statistics using the parameters specified from the command line
 
-    SparseSeveralCorrelatedAnalyses(datafile, inputfiles, {maf, threshold, test_threshold, minr, maxr, maxdistance, r2impute, chromosome, correctvalue, nvalue, use_multiple_r2, zchange, includefile, method, refsnpfile, genmapfile, sparse});
+    GetLowSignificancePGS(summarystats_file, pgm_file, hybrid_file, bgen_reffile_prefix, bgenixreffile_prefix, include_file, geneticmap_file, genetic_distance, outputprefix, {threshold, maxr, r2impute, correctvalue, nvalue, uncorrected, ancestry});
 
     return 0;
 }
@@ -1739,197 +1608,10 @@ map<Posclass, tuple<int, int64_t>> GetFilePositions(const string& inputfile, con
 }
 
 
-// Get stratified area under the curve that takes into account the study groups
-
-double GetStratRankSumStat(const VectorXi& status, const VectorXi& study, const VectorXd& p)
-{
-    map<int, map<double, vector<int>>> rankp;
-
-    forc(i, p)
-    {
-        if(status[i]==0 || status[i]==1) rankp[study[i]][p[i]].push_back(status[i]);
-    }
-
-    double weightsum = 0.0;
-
-    double ustrata_strat = 0.0;
-
-    for(auto& x: rankp)
-    {
-        double ranksum[2] = {0,0};
-
-        int studycounts[2] = {0,0};
-
-        double rankvalue = 0.5;
-
-        for(auto& v: x.second)
-        {
-            for(auto& w: v.second)
-            {
-                ranksum[w] += rankvalue + 0.5*v.second.size();
-
-                ++studycounts[w];
-            }
-
-            rankvalue += v.second.size();
-        }
-
-        double weight = double(studycounts[0]*studycounts[1])/(studycounts[0]+studycounts[1]+1);
-
-        weightsum += weight;
-
-        if(weight > 0)
-        {
-            ustrata_strat += weight*(ranksum[1] - studycounts[1]*double(studycounts[1]+1)/2.0)/(double(studycounts[0])*studycounts[1]);
-        }
-    }
-
-    ustrata_strat /= weightsum;
-
-    return ustrata_strat;
-}
-
-
-// Get pearson correlation between prs values and outcome
-
-double GetPearsonCorrelation(const VectorXd& regval, const VectorXd& prs)
-{
-    VectorXd regval_std = (regval.array()-regval.mean());
-
-    regval_std /= regval_std.norm();
-
-    VectorXd prs_std = (prs.array()-prs.mean());
-
-    regval_std /= prs_std.norm();
-
-    return regval_std.dot(prs_std);
-}
-
-
-// Get logistic statistics for calculated PRS values
-
-vector<double> GetPRSchi2(const PhenotypeData& phenotypedata, const VectorXd& p)
-{
-    Mlogit logit(phenotypedata);
-
-    MatrixXd cov(phenotypedata.cov.rows()+1, phenotypedata.cov.cols());
-
-    cov << RowVectorXd::Zero(phenotypedata.cov.cols()), phenotypedata.cov;
-
-    int count = 0;
-
-    forc(i, phenotypedata.include){
-        if(phenotypedata.include[i]){
-            cov(0, count) = p[i];
-            ++count;
-        }
-    }
-
-    double lik;
-
-    VectorXd x;
-
-    MatrixXd hessian;
-
-    logit.LogitStats(cov, lik, x, hessian);
-
-    return {x[0], sqrt(hessian(0,0)), 2*(lik-logit.liknull)};
-}
-
-
-// Get regression statistics for calculated PRS values
-
-vector<double> GetRegressionPRS(const PhenotypeData& phenotypedata, const VectorXd& p)
-{
-    int nstudies = phenotypedata.study.maxCoeff()+1;
-
-    int nparam = phenotypedata.cov.rows() + 1 + nstudies;
-
-    MatrixXd cov(nparam, phenotypedata.cov.cols());
-
-    cov << RowVectorXd::Zero(phenotypedata.cov.cols()), MatrixXd::Zero(nstudies, phenotypedata.cov.cols()), phenotypedata.cov;
-
-    int count = 0;
-
-    forc(i, phenotypedata.include){
-        if(phenotypedata.include[i]){
-            cov(0, count) = p[i];
-            cov(1+phenotypedata.study[count], count)=1;
-            ++count;
-        }
-    }
-
-    MatrixXd var = (cov*cov.transpose());
-
-    if(var.determinant()!=0){
-        var = var.inverse();
-
-        VectorXd c = cov*phenotypedata.regval;
-
-        VectorXd b = var*c;
-
-        double regsum = phenotypedata.regval.squaredNorm();
-
-        double ess = regsum - b.dot(c);
-
-        double se = sqrt(ess*var(0,0)/(phenotypedata.study.size()-cov.rows()));
-
-        return {b[0], se, Sqr(b[0]/se)};
-    }
-    else{
-        return {0.0,0.0,0.0};
-    }
-}
-
-
-template<class T>
-set<string> ConvertPositionsToIds(const string& bgenix_prefix, T& prsmap, bool multi_file = true)
-{
-    set<string> result;
-
-    Posclass posclass;
-
-    SplitStringView splitstr;
-
-    forv(i, 1, (multi_file?24:2)){
-        ifstream bgenix_input(multi_file?Paste(bgenix_prefix,i,".txt"):bgenix_prefix);
-
-        if(!bgenix_input) continue;
-
-        while(bgenix_input >> splitstr){
-            if(splitstr.size()>=7){
-                try {
-                    posclass = Posclass(ConvertChrStr(string(splitstr[2])), stoi(string(splitstr[3])), splitstr[5], splitstr[6]);
-
-                    //                    posclass = Posclass(ConvertChrStr(splitstr[2]), stoi(splitstr[3]), splitstr[5], splitstr[6]);
-
-
-                    if(prsmap.count(posclass)){
-                        result.emplace(splitstr[1]);
-                    }
-
-                    if(splitstr[5].size()!=1 || splitstr[6].size()!=1){
-                        posclass = Posclass(ConvertChrStr(string(splitstr[2])), stoi(string(splitstr[3])), splitstr[6], splitstr[5]);
-
-                        if(prsmap.count(posclass)){
-                            result.emplace(splitstr[1]);
-                        }
-                    }
-                } catch (...) {
-                    //                    cerr << "Error reading line containing\n" << splitstr.str() << "\n";
-                }
-            }
-        }
-    }
-
-    return result;
-}
-
-
 // This estimates the PRS based on the weightings given by the data structure
 // normally only one file is used but this routine was orignally written for several bgen files
 
-VectorXd GetPrincipalComponentValuesFromIds(const vector<string>& datafile, map<Posclass, vector<double>>& data, const vector<string>& rsids, int print=0)
+MatrixXd GetMultiplePrincipalComponentValuesFromIds(const vector<string>& datafile, map<Posclass, vector<double>>& data, const vector<string>& rsids, int print=0)
 {
     string linestr, rsnum;
 
@@ -1945,7 +1627,9 @@ VectorXd GetPrincipalComponentValuesFromIds(const vector<string>& datafile, map<
 
     int nsnps = 0;
 
-    vector<double> prsvec;
+    MatrixXd prsmat;
+
+    bool first_run = true;
 
     auto UpdatePRSdosages = [&](BgenParser& bgenparse){
         tie(imputeclass.ref, imputeclass.alt) = {alleles[0],alleles[1]};
@@ -1958,15 +1642,15 @@ VectorXd GetPrincipalComponentValuesFromIds(const vector<string>& datafile, map<
 
     // insertion deletions are not mapped if the order is different so check whether this is the case and mark for flipping
 
-    if(itor==data.end() && (imputeclass.ref.size()!=1 || imputeclass.alt.size()!=1)){
-        swap(imputeclass.ref, imputeclass.alt);
+        if(itor==data.end() && (imputeclass.ref.size()!=1 || imputeclass.alt.size()!=1)){
+            swap(imputeclass.ref, imputeclass.alt);
 
-        itor = data.find(Posclass{imputeclass});
+            itor = data.find(Posclass{imputeclass});
 
-        swap(imputeclass.ref, imputeclass.alt);
+            swap(imputeclass.ref, imputeclass.alt);
 
-        swapped = true;
-    }
+            swapped = true;
+        }
 
         if(itor != data.end())
         {
@@ -1982,32 +1666,28 @@ VectorXd GetPrincipalComponentValuesFromIds(const vector<string>& datafile, map<
                 factor = -1;        // insertion deletion that needs to be flipped
             }
 
-            bgenparse.UpdatePRS(prsvec, factor, itor->second[0], 2*itor->second[1]);
+//            bgenparse.ReadAllImputeclassDosages(imputeclass);
 
-            //            double value;
+            if(first_run){
+                prsmat.setZero(itor->second.size()-1, imputeclass.size());
 
-            //            forc(i, probs)
-            //            {
-            //                if(probs[i].size()==3)
-            //                {
-            //                    value = 2*probs[i][2]+probs[i][1];
-            //                }
-            //                else if(probs[i].size()==2)
-            //                {
-            //                    value = 2*probs[i][1];
-            //                }
-            //                else
-            //                {
-            //                    value = -1;
-            //                }
+                first_run = false;
+            }
 
-            //                if(value >= -1e-9)
-            //                {
-            //                    double meandiff = 2*(factor==-1) + factor*value - 2*itor->second[1];
+            Map<VectorXd> rate(itor->second.data(), itor->second.size()-1);
 
-            //                    prs[i] += meandiff * itor->second[0];
-            //                }
-            //            }
+            bgenparse.UpdateMultiPGS(prsmat, factor, rate, 2*itor->second.back());
+
+//            forc(i, imputeclass){
+//                double meandiff = 2*(factor==-1) + factor*imputeclass[i] - 2*itor->second.back();
+
+//                Map<VectorXd> eigenVector(itor->second.data(), itor->second.size()-1);
+
+//                prsmat.col(i) += meandiff*eigenVector;
+////                forl(j, itor->second.size()-1){
+////                    prsmat(j,i) += meandiff * itor->second[j];
+////                }
+//            }
 
             if(print){
                 ++nsnps;
@@ -2055,20 +1735,14 @@ VectorXd GetPrincipalComponentValuesFromIds(const vector<string>& datafile, map<
         }
     }
 
-    VectorXd prs(prsvec.size());
-
-    forc(i, prsvec){
-        prs[i] = prsvec[i];
-    }
-
-    return prs;
+    return prsmat;
 }
 
 
 // This estimates the PRS based on the weightings given by the data structure
 // normally only one file is used but this routine was orignally written for several bgen files
 
-VectorXd GetPrincipalComponentValuesFromSeveralBgenFiles(const vector<string>& datafile, map<Posclass, vector<double>>& data, const string& bgenix_prefix="", const vector<string>& chrx_files={}, int print=0)
+MatrixXd GetMultiplePrincipalComponentValuesFromSeveralBgenFiles(const vector<string>& datafile, map<Posclass, vector<double>>& data, const string& bgenix_prefix="", const vector<string>& chrx_files={}, int print=0)
 {
     string linestr, rsnum;
 
@@ -2091,10 +1765,10 @@ VectorXd GetPrincipalComponentValuesFromSeveralBgenFiles(const vector<string>& d
         }
     }();
 
-    auto value = GetPrincipalComponentValuesFromIds(datafile, data, rsids, 100);
+    auto value = GetMultiplePrincipalComponentValuesFromIds(datafile, data, rsids, 100);
 
     if(chrx_files.size()==2){
-        auto value2 = GetPrincipalComponentValuesFromIds({chrx_files[0]}, data, rsids, 100);
+        auto value2 = GetMultiplePrincipalComponentValuesFromIds({chrx_files[0]}, data, rsids, 100);
 
         zifstream input(chrx_files[1]);
 
@@ -2115,65 +1789,11 @@ VectorXd GetPrincipalComponentValuesFromSeveralBgenFiles(const vector<string>& d
                 exit(1);
             }
 
-            value[v.first] += value2[v.second];
+            value.col(v.first) += value2.col(v.second);
         }
     }
 
     return value;
-}
-
-// Get statistics for PRS values
-
-vector<double> GetPRSstats(const string& testphenotypefile, const vector<string>& testfile, const string& bgenix_prefix, const vector<string>& chrx_files, const string& analysis_group, map<Posclass, vector<double>>& prsmap, int cv_num, const string& weightings_file, const vector<double>& prs_values={}){
-
-    auto phenotypedata = GetPhenotypeData(testphenotypefile, analysis_group, cv_num);
-
-    // generate vector of prs values
-    // if prsmap is empty than generate values from the bgen file, otherwise use the prsmap values
-    // uses a lambda to initialise the vector
-
-    const VectorXd prs = [&]{
-        if(prs_values.empty()){
-            return GetPrincipalComponentValuesFromSeveralBgenFiles(testfile, prsmap, bgenix_prefix, chrx_files);
-        }
-        else{
-            return VectorXd(Map<const VectorXd>(prs_values.data(), prs_values.size()));
-        }
-    }();
-
-    // if weightings file is specified then write PRS values to that file
-
-    if(weightings_file!=""){
-        zofstream output(weightings_file);
-
-        output << "prs\n";
-
-        forc(i, prs){
-            output << prs[i] << '\n';
-        }
-    }
-
-    auto prsstats = (phenotypedata.status.size()!=0?GetPRSchi2(phenotypedata, prs):GetRegressionPRS(phenotypedata, prs));
-
-    VectorXd prs_filter(phenotypedata.study.size());
-
-    int filternum = 0;
-
-    forc(i, phenotypedata.include){
-        if(phenotypedata.include[i]==1){
-            prs_filter[filternum++] = prs[i];
-        }
-    }
-
-    double auc = (phenotypedata.status.size()!=0?GetStratRankSumStat(phenotypedata.status, phenotypedata.study, prs_filter):GetPearsonCorrelation(phenotypedata.regval, prs_filter));
-
-    prsstats.push_back(auc);
-
-    double prs_se = sqrt((prs_filter.array() - prs_filter.mean()).square().sum()/(prs_filter.size()-1));
-
-    prsstats.push_back(prs_se);
-
-    return prsstats;
 }
 
 
@@ -2369,6 +1989,33 @@ struct MCMC_parameters{
     double zdiff;
     int threshold_to_increase_runs = -1;
     vector<double> approximation_threshold;
+    vector<double> bounds;
+    string method;
+    vector<double> pvec;    // used for correlated phenotypes
+    vector<double> wvec;    // used for correlated phenotypes
+    double k = 1.0;         // extra option for generalised gamma (default will be 1)
+    double min_psi = 0.0;   // check if bounding above zero reduces variance of MCMC sampling
+    double regval = 0.0;    // regularisation factor for horseshoe model
+    bool use_ss_r2;
+    double eaf_power = 0.0;
+    double r2_power = 1.0;
+    bool functional_scores = false;
+
+    double CalcMaxPsi(double zscore) const
+    {
+        if(bounds.empty()) return 1.0e50;
+
+        double result = bounds[0];
+
+        for(int i=2;i<int(bounds.size());i+=2){
+            if(abs(zscore) < bounds[i-1]){
+                result = bounds[i];
+                break;
+            }
+        }
+
+        return result;
+    };
 };
 
 
@@ -2385,27 +2032,31 @@ VectorXd CalculateContinuousShrinkageEstimate(const vector<SNPdetails>& v, const
 
     boost::math::normal gaussian;
 
-    double zthreshold = -quantile(gaussian, mcmc_parameters.region_significance/2);
-
-    bool significant_region = abs(get<0>(v[0].stats[0])/get<1>(v[0].stats[1])) > zthreshold;
-
     // Put statistics in vectors b_marginal and se_marginal
-    // perhaps remove region factors later to simplify code
 
     forc(i, b_marginal){
         b_marginal[i] = get<0>(v[i].stats[0]);
 
         se_marginal[i] = get<1>(v[i].stats[0])*mcmc_parameters.inflation_factor;
-
-        phicorrection[i] = (significant_region && abs(v[i].position - v[0].position) < mcmc_parameters.region_distance ? mcmc_parameters.region_factor : 1.0/mcmc_parameters.region_factor);
-    }
+   }
 
     VectorXd zscores = b_marginal.cwiseQuotient(se_marginal);
+
+    if(mcmc_parameters.method == "stepwise"){
+
+        LLT<MatrixXd> zllt(corr);
+
+        VectorXd beta_est = zllt.solve(zscores);
+
+        return beta_est.cwiseProduct(se_marginal);
+    }
+
+    VectorXd maxpsi = zscores.unaryExpr([&](double x){return mcmc_parameters.CalcMaxPsi(x);});
 
     int n_pst = (mcmc_parameters.n_iter-mcmc_parameters.n_burnin)/mcmc_parameters.thin;
 
 
-            // initialization
+            // initialisation
 
     VectorXd beta(zscores.size());
 
@@ -2422,16 +2073,24 @@ VectorXd CalculateContinuousShrinkageEstimate(const vector<SNPdetails>& v, const
 
     psi = VectorXd::Ones(zscores.size());
 
-    VectorXd phivec = mcmc_parameters.phi*se_marginal.cwiseInverse().cwiseAbs2().cwiseProduct(phicorrection);
+    VectorXd phivec = mcmc_parameters.phi*se_marginal.cwiseInverse().cwiseAbs2();
 
     forc(i, phivec){
-//        phivec[i] *= 1.0*exp(0.02*(1-pow(v[i].ref_r2,-5)));
-        phivec[i] *= 1.2*v[i].ref_r2;
+        if(mcmc_parameters.use_ss_r2){
+            phivec[i] *= pow(1.2*v[i].ss_r2, mcmc_parameters.r2_power) * v[i].functional_score;
+        }
+        else{
+            phivec[i] *= pow(1.2*(v[i].ref_r2 > 0 ? v[i].ref_r2 : 0.1), mcmc_parameters.r2_power) *v[i].functional_score;     // for monomorphic reference set default of 0.1
+        }
     }
 
     if(mcmc_parameters.eaf_variance==1){
         forc(i,phivec){
-            phivec[i] /= v[i].eaf*(1-v[i].eaf)/0.0475;
+            if(v[i].ref_r2 > 0){                                    // check if monomorphic reference
+                phivec[i] /= pow(v[i].eaf*(1-v[i].eaf)/0.0475, mcmc_parameters.eaf_power);
+
+                phivec[i] *= v[i].functional_score;
+            }
         }
     }
 
@@ -2448,6 +2107,8 @@ VectorXd CalculateContinuousShrinkageEstimate(const vector<SNPdetails>& v, const
     vector<array<int,10>> nband(zscores.size());
 
     forv(itr, 1,mcmc_parameters.n_burnin+ntests+1){
+
+
 
         vector<int> indices, indices2, indices3;
 
@@ -2479,6 +2140,13 @@ VectorXd CalculateContinuousShrinkageEstimate(const vector<SNPdetails>& v, const
         VectorXd psi2 = psi(indices);
 
         MatrixXd dinvt2 = MatrixXd(psi2.asDiagonal().inverse()) + corr(indices, indices);
+
+        if(mcmc_parameters.regval > 1e-10){
+            dinvt2.diagonal().array() += mcmc_parameters.regval;
+        }
+        else if(mcmc_parameters.method=="reg"){
+            dinvt2 += maxpsi.asDiagonal().inverse();
+        }
 
         MatrixXd transform2 = LLT<MatrixXd>(dinvt2).matrixL();
 
@@ -2542,6 +2210,18 @@ VectorXd CalculateContinuousShrinkageEstimate(const vector<SNPdetails>& v, const
 
         beta_all(indices3) = beta_rem_result;
 
+        if(!beta_all.allFinite()){
+
+            cout << "Failed on run " << itr << '\n';
+
+            forc(i, beta_all){
+//                if(!isfinite(beta_all[i])){
+                    cout << i+1 << '\t' << beta_all[i] << '\t' << v[i].rsnum << '\t' << get<0>(v[i].stats[0]) << '\t' << get<1>(v[i].stats[0]) << '\n';
+//                }
+            }
+            exit(1);
+        }
+
 
 
 //        forc(i, beta_tmp2){
@@ -2567,14 +2247,26 @@ VectorXd CalculateContinuousShrinkageEstimate(const vector<SNPdetails>& v, const
 
 //        cout << beta_all - beta << "\n\n";
 
-        forc(i, delta){
-            delta[i] = gamma_distribution<>(mcmc_parameters.a+mcmc_parameters.b, 1.0/(psi[i]+phivec[i]))(gen);
+
+        if(abs(mcmc_parameters.k - 1.0) < 1.0e-5){
+            forc(i, delta){
+                delta[i] = gamma_distribution<>(mcmc_parameters.a+mcmc_parameters.b, 1.0/(psi[i]+phivec[i]))(gen);
+            }
+        }
+        else{
+            forc(i, delta){
+                double random_gamma = gamma_distribution<>(mcmc_parameters.a+mcmc_parameters.b, 1.0)(gen);
+
+                delta[i] = pow(random_gamma, 1.0/mcmc_parameters.k)/(psi[i]+phivec[i]);
+            }
         }
 
         forc(i, psi){
             psi[i] = gigrnd(mcmc_parameters.a-0.5, 2*delta[i], Sqr(beta_all[i]), gen);
 
-            if(psi[i] > mcmc_parameters.max_phi) psi[i] = mcmc_parameters.max_phi;
+            if(psi[i] > maxpsi[i] && mcmc_parameters.method!="reg" && mcmc_parameters.regval<1e-10) psi[i] = maxpsi[i];
+
+            if(psi[i] < mcmc_parameters.min_psi) psi[i] = mcmc_parameters.min_psi;
         }
 
         // posterior
@@ -2600,6 +2292,16 @@ VectorXd CalculateContinuousShrinkageEstimate(const vector<SNPdetails>& v, const
             beta_mean_all(indices2) = beta3_mean;
 
             beta_mean_all(indices3) = beta_rem_mean;
+
+            if(!beta_mean_all.allFinite()){
+                forc(i, beta_mean_all){
+                    cout << "Mean calculation\n";
+                    if(!isfinite(beta_mean_all[i])){
+                        cout << i+1 << '\t' << beta_mean_all[i] << '\t' << v[i].rsnum << '\n';
+                    }
+                }
+                exit(1);
+            }
 
 //            cout << beta_mean - beta_mean_all << "\n\n";
 
@@ -2642,34 +2344,13 @@ VectorXd CalculateContinuousShrinkageEstimate(const vector<SNPdetails>& v, const
 }
 
 
-// This shrinks the estimates contained in the vector v based on the correlation matrix and the specified continuous shrinkage parameters
-// Most of this code was adapted from the PRScs python code
-
-VectorXd SparseCalculateContinuousShrinkageEstimate(const vector<SNPdetails>& v, const MatrixXd& corr, const MCMC_parameters& mcmc_parameters){
-
-    int ndim = corr.rows();
-
-    SpMat corrsparse(ndim, ndim);
-
-    forl(i,ndim){
-        forl(j, ndim){
-            if(corr(j,i)!=0.0){
-                corrsparse.insert(j,i) = corr(j,i);
-            }
-        }
-    }
+VectorXd SpikeAndSlab(const vector<SNPdetails>& v, const MatrixXd& corr, const MCMC_parameters& mcmc_parameters, std::mt19937& gen){
 
     VectorXd b_marginal(v.size());
 
     VectorXd se_marginal(v.size());
 
-    VectorXd phicorrection(v.size());
-
     boost::math::normal gaussian;
-
-    double zthreshold = -quantile(gaussian, mcmc_parameters.region_significance/2);
-
-    bool significant_region = abs(get<0>(v[0].stats[0])/get<1>(v[0].stats[1])) > zthreshold;
 
     // Put statistics in vectors b_marginal and se_marginal
     // perhaps remove region factors later to simplify code
@@ -2677,81 +2358,204 @@ VectorXd SparseCalculateContinuousShrinkageEstimate(const vector<SNPdetails>& v,
     forc(i, b_marginal){
         b_marginal[i] = get<0>(v[i].stats[0]);
 
-        se_marginal[i] = get<1>(v[i].stats[0])*mcmc_parameters.inflation_factor;
-
-        phicorrection[i] = (significant_region && abs(v[i].position - v[0].position) < mcmc_parameters.region_distance ? mcmc_parameters.region_factor : 1.0/mcmc_parameters.region_factor);
+        se_marginal[i] = get<1>(v[i].stats[0]);
     }
 
     VectorXd zscores = b_marginal.cwiseQuotient(se_marginal);
-
-    int n_pst = (mcmc_parameters.n_iter-mcmc_parameters.n_burnin)/mcmc_parameters.thin;
-
 
             // initialization
 
     VectorXd beta(zscores.size());
 
-    VectorXd psi(zscores.size());
-
-    VectorXd delta(zscores.size());
-
     VectorXd beta_est(zscores.size());
 
-
-    beta = delta = beta_est = VectorXd::Zero(zscores.size());
-
-    psi = VectorXd::Ones(zscores.size());
-
-    VectorXd phivec = mcmc_parameters.phi*se_marginal.cwiseInverse().cwiseAbs2().cwiseProduct(phicorrection);
+    beta = beta_est = VectorXd::Zero(zscores.size());
 
             // MCMC
 
-//    std::mt19937 gen(253);
-
-    std::random_device rd{};
-    std::mt19937 gen{rd()};
-
     std::normal_distribution<> rnorm{0,1};
 
+    std::uniform_real_distribution<> runiform{0.0,1.0};
 
-    forv(itr, 1,mcmc_parameters.n_iter+1){
+    int ntests = mcmc_parameters.n_iter - mcmc_parameters.n_burnin;
 
-        SpMat dinvt = SpMat(DiagonalMatrix<double,Eigen::Dynamic>(psi.asDiagonal().inverse())) + corrsparse;
+    forv(itr, 1,mcmc_parameters.n_burnin+ntests+1){
 
-//        MatrixXd dinvt = MatrixXd(psi.asDiagonal().inverse()) + corr;
+        forc(i, zscores){
+            double res = zscores[i] + beta[i] - beta.dot(corr.col(i));
 
-        SpMat transform = SimplicialLLT<SpMat>(dinvt).matrixL();
+            double c1 = Sqr(mcmc_parameters.phi);
 
-//        MatrixXd transform = LLT<MatrixXd>(dinvt).matrixL();
+            double c2 = 1.0 / (1.0 + 1.0/c1);
 
-        VectorXd beta_tmp = transform.triangularView<Lower>().solve(zscores);
+            double c3 = c2*res;
 
-        forc(i, beta_tmp){
-            beta_tmp[i] += rnorm(gen);
-        }
+            double c4 = sqrt(c2);
 
-        beta = transform.triangularView<Lower>().transpose().solve(beta_tmp);
+            double post_p_j = 1.0/(1.0 + sqrt(1+c1)*exp(-Sqr(c3/c4)/2)*(1-mcmc_parameters.b)/mcmc_parameters.b);
 
-        forc(i, delta){
-            delta[i] = gamma_distribution<>(mcmc_parameters.a+mcmc_parameters.b, 1.0/(psi[i]+phivec[i]))(gen);
-        }
+            if(runiform(gen) < post_p_j){
+                beta[i] = c3 + rnorm(gen) * c4;
+            }
+            else{
+                beta[i] = 0.0;
+            }
 
-        forc(i, psi){
-            psi[i] = gigrnd(mcmc_parameters.a-0.5, 2*delta[i], Sqr(beta[i]), gen);
-
-            if(psi[i] > mcmc_parameters.max_phi) psi[i] = mcmc_parameters.max_phi;
-        }
-
-        // posterior
-        if(itr>mcmc_parameters.n_burnin && itr % mcmc_parameters.thin == 0){
-
-
-            beta_est = beta_est + beta/n_pst;
+            if(itr>mcmc_parameters.n_burnin){
+                beta_est[i] += (c3*post_p_j) / ntests;
+            }
         }
     }
 
     return beta_est.cwiseProduct(se_marginal);
 }
+
+
+MatrixXd MultiPhenoShrink(const vector<SNPdetails>& v, const MatrixXd& corr, const MCMC_parameters& mcmc_parameters, std::mt19937& gen){
+
+    MatrixXd b_marginal(3, v.size());
+
+    MatrixXd se_marginal(3, v.size());
+
+    boost::math::normal gaussian;
+
+    // Put statistics in vectors b_marginal and se_marginal
+    // perhaps remove region factors later to simplify code
+
+    forl(i, v.size()){
+        forl(j, 3){
+            b_marginal(j,i) = get<0>(v[i].stats[j]);
+
+            se_marginal(j,i) = get<1>(v[i].stats[j]);
+        }
+    }
+
+    MatrixXd zscores = b_marginal.cwiseQuotient(se_marginal);
+
+            // initialization
+
+    MatrixXd beta;
+
+    MatrixXd beta_est;
+
+    beta = beta_est = MatrixXd::Zero(3, v.size());
+
+            // MCMC
+
+    std::normal_distribution<> rnorm{0,1};
+
+    std::uniform_real_distribution<> runiform{0.0,1.0};
+
+    int ntests = mcmc_parameters.n_iter - mcmc_parameters.n_burnin;
+
+    VectorXd res(3), c1(3);
+
+    forc(i,c1){
+        c1[i] = Sqr(mcmc_parameters.wvec[i]);
+    }
+
+    VectorXd c2 = 1.0 / (1.0 + 1.0/c1.array());
+
+    VectorXd c4 = c2.cwiseSqrt();
+
+    forv(itr, 1,mcmc_parameters.n_burnin+ntests+1){
+
+        forl(i, v.size()){
+
+            res[0] = zscores(0,i) + beta(0,i) - beta.row(0).dot(corr.col(i));
+
+            res[1] = zscores(1,i) + beta(1,i) - beta.row(1).dot(corr.col(i));
+
+            res[2] = zscores(2,i) + beta(2,i) - beta.row(2).dot(corr.col(i));
+
+            VectorXd c3 = c2.array()*res.array();
+
+            VectorXd ratio = c3.array()/c4.array();
+
+            VectorXd exp_values = ratio.cwiseAbs2().array()/2.0;
+
+            double max_value = max(exp_values[0], exp_values[1]+exp_values[2]);
+
+            VectorXd lik(5);
+
+// to avoid numerical overflow take exp of values with a maximum of 0
+
+            lik[0] = exp(-max_value);
+            lik[1] = exp(exp_values[0]-max_value)/sqrt(1+c1[0]);
+            lik[2] = exp(exp_values[1]-max_value)/sqrt(1+c1[1]);
+            lik[3] = exp(exp_values[2]-max_value)/sqrt(1+c1[2]);
+            lik[4] = exp(exp_values[1]+exp_values[2]-max_value)/sqrt(1+c1[1])/sqrt(1+c1[2]);
+
+//            exp_values.array()
+
+//            VectorXd lik = exp(exp_values.array())/sqrt(1 + c1.array());
+
+            VectorXd wt{{1.0/Sqr(se_marginal(1,i)), 1.0/Sqr(se_marginal(2,i))}};
+
+            wt = wt/wt.sum();
+
+            wt = wt.cwiseSqrt();
+
+            VectorXd plik(5);
+
+            plik[0] = (1.0 - mcmc_parameters.pvec[0] - mcmc_parameters.pvec[1] - mcmc_parameters.pvec[2] - mcmc_parameters.pvec[3])*lik[0];
+
+            plik[1] = mcmc_parameters.pvec[0] * lik[1];
+
+            plik[2] = mcmc_parameters.pvec[1] * lik[2];
+
+            plik[3] = mcmc_parameters.pvec[2] * lik[3];
+
+            plik[4] = mcmc_parameters.pvec[3] * lik[4];
+
+            VectorXd prob = plik/plik.sum();
+
+            if(isnan(prob[0])){
+                cout << "Error in calculating probability\n";
+            }
+
+
+//            double post_p_j = 1.0/(1.0 + sqrt(1+c1)*exp(-Sqr(c3/c4)/2)*(1-mcmc_parameters.b)/mcmc_parameters.b);
+
+            double rv = runiform(gen);
+
+            if(rv < prob[0]){
+                beta.col(i) = VectorXd::Zero(3);
+            }
+            else if(rv < prob[0] + prob[1]){
+                beta(0,i) = c3[0] + rnorm(gen) *c4[0];
+                beta(1,i) = wt[0] *beta(0,i);
+                beta(2,i) = wt[1] * beta(0,i);
+            }
+            else if(rv < prob[0] + prob[1] + prob[2]){
+                beta(1,i) = c3[1] + rnorm(gen) * c4[1];
+                beta(0,i) = wt[0] * beta(1,i);
+            }
+            else if(rv < prob[0]+prob[1]+prob[2]+prob[3]){
+                beta(2,i) = c3[2] * rnorm(gen) * c4[2];
+                beta(0,i) = wt[1] * beta(2,i);
+            }
+            else{
+                beta(1,i) = c3[1] + rnorm(gen) * c4[1];
+                beta(2,i) = c3[2] * rnorm(gen) * c4[2];
+                beta(0,i) = wt[0] * beta(1,i) + wt[1]*beta(2,i);
+            }
+
+            if(itr>mcmc_parameters.n_burnin){                
+                beta_est(0,i) += (prob[1]*c3[0] + (prob[2]+prob[4])*c3[1]*wt[0]+(prob[3]+prob[4])*c3[2]*wt[1])/ntests;
+                beta_est(1,i) += (prob[1]*c3[0]*wt[0] + (prob[2]+prob[4])*c3[1])/ntests;
+                beta_est(2,i) += (prob[1]*c3[0]*wt[1] + (prob[3]+prob[4])*c3[2])/ntests;
+
+                if(isnan(beta_est(0,i))){
+                    cout << "Error in calculating probability\n";
+                }
+            }
+        }
+    }
+
+    return beta_est.cwiseProduct(se_marginal);
+}
+
 
 // used to calculate stepwise estimate
 
@@ -2838,13 +2642,15 @@ void AdjustMatrix(const Adjust_parameters& adjust_parameters, const vector<SNPde
 
     forc(i, b_marginal){
         forl(j, i){
-            double n1 = min(1.0, 1.0/(v[i].ref_r2*v[i].eaf*(1-v[i].eaf)*Sqr(get<1>(v[i].stats[0]))*adjust_parameters.base_num));
+            if(v[i].ref_r2 > 0 && v[j].ref_r2>0){                       // only adjust correlation for entries when reference is not monomorphic
+                double n1 = min(1.0, 1.0/(v[i].ref_r2*v[i].eaf*(1-v[i].eaf)*Sqr(get<1>(v[i].stats[0]))*adjust_parameters.base_num));
 
-            double n2 = min(1.0, 1.0/(v[j].ref_r2*v[j].eaf*(1-v[j].eaf)*Sqr(get<1>(v[j].stats[0]))*adjust_parameters.base_num));
+                double n2 = min(1.0, 1.0/(v[j].ref_r2*v[j].eaf*(1-v[j].eaf)*Sqr(get<1>(v[j].stats[0]))*adjust_parameters.base_num));
 
-            double adjustment = sqrt(min(n1, n2)/max(n1, n2));
+                double adjustment = sqrt(min(n1, n2)/max(n1, n2));
 
-           corr(j,i) = corr(i,j) = adjust_parameters.corr_damp*adjustment*corr(j,i);
+                corr(j,i) = corr(i,j) = adjust_parameters.corr_damp*adjustment*corr(j,i);
+            }
         }
     }
 }
@@ -2855,8 +2661,7 @@ void AdjustMatrix(const Adjust_parameters& adjust_parameters, const vector<SNPde
 // otherwise a stepwise estimate is used
 // cv_num is the cross validation index, that in most cases won't be used if using an external test set
 
-template<class T>
-vector<double> GeneralPRSscores(const string& inputfile, int cv_num, const string& reference_file_prefix, const T& mcmc_parameters, const Adjust_parameters& adjust_parameters, const string& analysis_group, const string& outputfile="", const vector<string>& testfile={}, const string& bgenix_prefix="", const vector<string>& chrx_files={}, const string& testphenotypefile=""){
+vector<double> GeneralPRSscores(const string& inputfile, const string& reference_file_prefix, const MCMC_parameters& mcmc_parameters, const Adjust_parameters& adjust_parameters, const string& analysis_group, const string& outputfile="", const vector<string>& testfile={}, const string& bgenix_prefix="", const vector<string>& chrx_files={}, const string& testphenotypefile=""){
 
 // Read File and separate into correlated groups
 
@@ -2871,7 +2676,21 @@ vector<double> GeneralPRSscores(const string& inputfile, int cv_num, const strin
             group_results.push_back(vector<SNPdetails>());
         }
 
-        group_results.back().push_back(SNPdetails{splitstr[2], splitstr[6], stoi(splitstr[7]), 0.0, splitstr[8], splitstr[9], stod(splitstr[10]), stod(splitstr[11]), -1, 1.0, {{stod(splitstr[12]), stod(splitstr[13])}}});
+        SNPdetails snpdetails{splitstr[2], splitstr[6], stoi(splitstr[7]), 0.0, splitstr[8], splitstr[9], stod(splitstr[10]), stod(splitstr[11]), -1, 1.0, 1.0, 1.0, {{stod(splitstr[12]), stod(splitstr[13])}}};
+
+        if(splitstr.size()>14 + mcmc_parameters.functional_scores){
+            for(int i=14;i<splitstr.size()-1-mcmc_parameters.functional_scores;i+=2){
+                snpdetails.stats.push_back({stod(splitstr[i]), stod(splitstr[i+1])});
+            }
+        }
+
+        if(mcmc_parameters.functional_scores){
+            snpdetails.functional_score = stod(splitstr[splitstr.size()-1]);
+        }
+
+        if(snpdetails.functional_score>0 || !mcmc_parameters.functional_scores){
+            group_results.back().push_back(snpdetails);
+        }
     }
 
 // Get list of chromosomes and positions to extract data
@@ -2901,7 +2720,7 @@ vector<double> GeneralPRSscores(const string& inputfile, int cv_num, const strin
 
     int nflips = 0;
 
-    string weights_file = (cv_num==-1 || adjust_parameters.weights_file==""?adjust_parameters.weights_file:Paste(adjust_parameters.weights_file,cv_num,".txt"));
+    string weights_file = adjust_parameters.weights_file;
 
     vector<double> autosomal_residuals = (weights_file==""?vector<double>():FileRead<vector<double>>(weights_file));
 
@@ -2913,7 +2732,7 @@ vector<double> GeneralPRSscores(const string& inputfile, int cv_num, const strin
         }
     }
 
-    string chrX_weights_file = (cv_num==-1 || adjust_parameters.chrX_weights_file==""?adjust_parameters.chrX_weights_file:Paste(adjust_parameters.chrX_weights_file,cv_num,".txt"));
+    string chrX_weights_file = adjust_parameters.chrX_weights_file;
 
     // if chromosome X individuals not specified then assume autosomal individuals are to be used
 
@@ -2972,70 +2791,205 @@ vector<double> GeneralPRSscores(const string& inputfile, int cv_num, const strin
 
         int nsamples = bgenParser.number_of_samples();
 
-        if(prs.size()==0){
-            prs = VectorXd::Zero(nsamples);
+        vector<double> residuals_filtered;
+
+        bool is_weighted = false;
+
+        if(!residuals.empty()){
+            for(auto& v:residuals){
+
+                if(v!=0){
+                    residuals_filtered.push_back(v);
+
+                    if(abs(v-1.0)> 1e-07){
+                        is_weighted = true;
+                    }
+                }
+            }
         }
 
-        MatrixXd mat(nsamples, v.size());
+//        MatrixXd mat(nsamples, v.size());
 
-        MatrixXd matnorm(nsamples, v.size());
+        MatrixXd matnorm(residuals.empty()?nsamples:residuals_filtered.size(), v.size());
 
         forc(i, v){
             auto p2 = GetPosIterator(snpposmap, v[i]);
 
             if(p2==snpposmap.end()){
-                continue;
+                cerr << "Could not find snp " << v[i].rsnum << "\n";
+                exit(1);
             }
 
-            bgenParser.JumpToPosition(get<1>(p2->second));
+//            bgenParser.JumpToPosition(get<1>(p2->second));
 
-            bgenParser.ReadAllImputeclass(imputeclass);
+//            bgenParser.ReadAllImputeclass(imputeclass);
 
-            int flip = MatchAlleles(imputeclass, FlipCheck{v[i].baseline, v[i].effect});    // are the alleles in the same order as the test statistics
+//            int flip = MatchAlleles(imputeclass, FlipCheck{v[i].baseline, v[i].effect});    // are the alleles in the same order as the test statistics
 
-            if(flip!=1){
-                cout << v[i].rsnum << ' ' << ++nflips << '\n';
-            }
+//            if(flip!=1){
+//                cout << v[i].rsnum << ' ' << ++nflips << '\n';
+//            }
 
             if(weights_file!=""){
-
-                double mean = 0;
-                double total_weight = 0;
-                forc(j, imputeclass){
-                    mean += imputeclass[j]*residuals[j];
-                    total_weight += residuals[j];
-                }
-                mean /= total_weight;
-
-                forl(j, nsamples){
-                    mat(j, i) = flip*(imputeclass[j] - mean);
-
-                    matnorm(j, i)  = flip*residuals[j]*(imputeclass[j] - mean);
-                }
-
-                matnorm.col(i) = matnorm.col(i)/matnorm.col(i).norm();
-
-
-                bgenParser.JumpToPosition(get<1>(p->second));
+                bgenParser.JumpToPosition(get<1>(p2->second));
 
                 bgenParser.ReadImputeclass(imputeclassfiltered, include);
 
-                v[i].ref_r2 = imputeclassfiltered.r2;
+                int flip = MatchAlleles(imputeclassfiltered, FlipCheck{v[i].baseline, v[i].effect});
+
+                if(v[0].stats.size()>1 && mcmc_parameters.method!="multipheno"){
+                    matnorm.col(i) = flip * CreateAncestryNormalised(imputeclassfiltered, residuals_filtered, v[i]);
+
+                    v[i].ref_r2 = imputeclassfiltered.r2;
+                }
+                else{
+                    Eigen::Map<VectorXd> tempvec(imputeclassfiltered.genotypes.data(), imputeclassfiltered.size());  // doesn't matter if this is changed
+
+                    if(is_weighted){
+                        Eigen::Map<VectorXd> res_filtered(residuals_filtered.data(), residuals_filtered.size());
+
+                        double weighted_mean = tempvec.dot(res_filtered)/tempvec.sum();
+
+                        tempvec = (tempvec.array()-weighted_mean)*res_filtered.array();
+                    }
+                    else{
+                        tempvec.array() -= tempvec.mean();
+                    }
+
+                    double norm = tempvec.norm();
+
+
+//                    tempvec = flip * tempvec/(norm==0?1.0:norm);
+
+                    matnorm.col(i) = flip*tempvec.transpose()/(norm==0?1.0:norm);
+
+                    v[i].ref_r2 = imputeclassfiltered.r2;
+
+//                    bgenParser.JumpToPosition(get<1>(p2->second));
+
+//                    bgenParser.ReadAllImputeclass(imputeclass);
+
+//                    double mean = 0;
+//                    double total_weight = 0;
+//                    forc(j, imputeclass){
+//                        mean += imputeclass[j]*residuals[j];
+//                        total_weight += residuals[j];
+//                    }
+//                    mean /= total_weight;
+
+//                    if(isnan(mean)){
+//                        cout << total_weight << '\n';
+
+//                        exit(1);
+//                    }
+
+//                    bgenParser.JumpToPosition(get<1>(p2->second));
+
+//                    bgenParser.ReadAllImputeclass(imputeclass);
+
+//                    int flip = MatchAlleles(imputeclass, FlipCheck{v[i].baseline, v[i].effect});
+
+
+//                    forl(j, nsamples){
+//                        mat(j, i)  = flip*residuals[j]*(imputeclass[j] - mean);
+//                    }
+
+//                    if(mat.col(i).norm()>0.0){                                          // change this to account for 0 frequencies in multi-ethnic analyses
+//                        mat.col(i) = mat.col(i)/mat.col(i).norm();
+//                    }
+
+//                    int count = 0;
+
+//                    forc(j, include){
+//                        if(include[j]){
+//                            if(abs(tempvec[count]-matnorm(j,i))>1e-16){
+//                                cout << j << ' ' << tempvec[count] - matnorm(j,i) << '\n';
+//                            }
+//                            count++;
+//                        }
+//                        else{
+//                            if(matnorm(j,i)!=0){
+//                                cout << j << ' ' << matnorm(j,i) << '\n';
+//                            }
+//                        }
+//                    }
+
+
+//                    VectorXd tempvec2(nsamples);
+
+//                    forl(j, nsamples){
+
+//                        tempvec2[j]  = flip*residuals[j]*(imputeclass[j] - mean);
+//                    }
+
+//                    tempvec2 /= tempvec2.norm();
+
+//                    int k = 0;
+
+//                    VectorXd tempvec3(tempvec.size());
+
+//                    for(auto& v: tempvec2){
+//                        if(v!= 0){
+//                            tempvec3[k] = v;
+//                            k++;
+//                        }
+//                    }
+
+//                    VectorXd tempvec4 = tempvec.transpose()/norm;
+
+////                    forc(j, tempvec3){
+////                        if(abs(tempvec3[j] - tempvec4[j]) > 1e-20){
+////                            cout << j << ' ' << tempvec3[j]-tempvec4[j] << '\n';
+////                        }
+////                    }
+
+//                    matnorm.col(i) = tempvec3;
+
+
+//                    bgenParser.JumpToPosition(get<1>(p2->second));
+
+//                    bgenParser.ReadImputeclass(imputeclassfiltered, include);
+                }
             }
             else{
+                bgenParser.JumpToPosition(get<1>(p2->second));
+
+                bgenParser.ReadAllImputeclass(imputeclass);
+
+                int flip = MatchAlleles(imputeclass, FlipCheck{v[i].baseline, v[i].effect});    // are the alleles in the same order as the test statistics
+
+
                 forl(j, nsamples){
-                    mat(j, i) = matnorm(j,i) = flip*(imputeclass[j] - 2*imputeclass.eaf);
+                    matnorm(j,i) = flip*(imputeclass[j] - 2*imputeclass.eaf);
                 }
 
                 matnorm.col(i) = matnorm.col(i)/matnorm.col(i).norm();
 
                 v[i].ref_r2 = imputeclass.r2;
             }
+
+            v[i].ss_r2 = 1.0/(v[i].eaf*(1-v[i].eaf)*Sqr(get<1>(v[i].stats[0]))*adjust_parameters.base_num);
+
+            if(v[i].ss_r2>1) v[i].ss_r2 = 1;
         }
 
         // as matnorm is normalised to have mean 0 and the sum of squares to be 1 can calculate the correlation matrix
 
+//        MatrixXd corr = matnorm.transpose()*matnorm;
+
+//        MatrixXd corr = mat.transpose()*mat;
+
         MatrixXd corr = matnorm.transpose()*matnorm;
+
+//        if((corr.reshaped()-corr2.reshaped()).norm()>1e-14){
+//            cout << (corr.reshaped()-corr2.reshaped()).norm() << "\n\n";
+
+//            cout << corr << "\n\n" << corr2 << "\n\n";
+//        }
+
+        forl(i, corr.rows()){                                                         // change this as 0 frequencies not normalised
+            corr(i,i) = 1.0;
+        }
 
         AdjustMatrix(adjust_parameters, v, corr);       // Adjust matrix to take account of different correlation accuracies
 
@@ -3043,49 +2997,50 @@ vector<double> GeneralPRSscores(const string& inputfile, int cv_num, const strin
 
         VectorXd estimate;
 
+        MatrixXd estimate_multi;
+
         // if constexpr determines the T and chooses the corresponding function for shrinkage
 
-        if constexpr(is_same<T, MCMC_parameters>()){
-            if(mcmc_parameters.sparse < 1){
 
-                vector<double> genpos(v.size());
-
-                forc(i, genpos){
-                    genpos[i] = CalcGeneticPosition(genmap[chromosome], v[i].position);
-                }
-
-                forl(i, corr.rows()){
-                    forl(j,i){
-                        double gen_dist = abs(genpos[i] - genpos[j]);
-
-                        if(gen_dist >= adjust_parameters.uncorrdist && abs(corr(i,j))<mcmc_parameters.sparse){
-                            corr(j,i) = corr(i,j)=0;
-                        }
-                    }
-                }
-
-                estimate = SparseCalculateContinuousShrinkageEstimate(v, corr, mcmc_parameters);
-            }
-            else{
-                estimate = CalculateContinuousShrinkageEstimate(v, corr, mcmc_parameters, gen);
-            }
+        if(mcmc_parameters.method == "spikeandslab"){
+            estimate = SpikeAndSlab(v, corr, mcmc_parameters, gen);
+        }
+        else if(mcmc_parameters.method == "multipheno"){
+            estimate_multi = MultiPhenoShrink(v, corr,mcmc_parameters, gen);
         }
         else{
-            estimate = CalculateStepwiseEstimate(v, corr, mcmc_parameters);
+            if(adjust_parameters.seed>=0){
+                gen.seed(adjust_parameters.seed);
+            }
+
+            estimate = CalculateContinuousShrinkageEstimate(v, corr, mcmc_parameters, gen);
         }
 
+
         if(outputfile!=""){
-            forc(i, v){
+            if(mcmc_parameters.method == "multipheno"){
+                forc(i, v){
 
-                string chromosome = v[i].chromosome;
+                    string chromosome = v[i].chromosome;
 
-                if(chromosome=="X") chromosome = "23";
+                    if(chromosome=="X") chromosome = "23";
 
-                Printtabline(output, v[i].rsnum, chromosome, v[i].position, v[i].baseline, v[i].effect, estimate[i], v[i].eaf);
+                    Printtabline(output, v[i].rsnum, chromosome, v[i].position, v[i].baseline, v[i].effect, estimate_multi(0,i), estimate_multi(1, i), estimate_multi(2, i), v[i].eaf);
+                }
+            }
+            else{
+                forc(i, v){
+
+                    string chromosome = v[i].chromosome;
+
+                    if(chromosome=="X") chromosome = "23";
+
+                    Printtabline(output, v[i].rsnum, chromosome, v[i].position, v[i].baseline, v[i].effect, estimate[i], v[i].eaf);
+                }
             }
         }
 
-        if(!testfile.empty() || chrx_files.size()==2){
+        if((!testfile.empty() || chrx_files.size()==2) && mcmc_parameters.method != "multipheno"){
             forc(i, v){
 
                 string chromosome = v[i].chromosome;
@@ -3096,113 +3051,21 @@ vector<double> GeneralPRSscores(const string& inputfile, int cv_num, const strin
             }
         }
 
-        prs += mat * estimate;
-
         cout << ++num << '\n';
     }
 
+    output.pop();   // make sure output file is written to before generating the PGS scores which can take time
+
     // need to add an option for regression or possibly not use cv_num
 
-    if(cv_num!=-1){
 
-        auto phenotypedata = GetPhenotypeData(testphenotypefile, analysis_group, cv_num);
+    if((!testfile.empty() || chrx_files.size()==2) && mcmc_parameters.method != "multipheno"){
 
-        auto prsstats = GetPRSchi2(phenotypedata, prs);
-
-        VectorXd prs_filter(phenotypedata.status.size());
-
-        int filternum = 0;
-
-        forc(i, phenotypedata.include){
-            if(phenotypedata.include[i]==1){
-                prs_filter[filternum++] = prs[i];
-            }
-        }
-
-        double auc = GetStratRankSumStat(phenotypedata.status, phenotypedata.study, prs_filter);
-
-        prsstats.push_back(auc);
-
-        double prs_se = sqrt((prs_filter.array() - prs_filter.mean()).square().sum()/(prs_filter.size()-1));
-
-        prsstats.push_back(prs_se);
-
-        return prsstats;
-    }
-    else if(!testfile.empty() || chrx_files.size()==2){
-
-        return GetPRSstats(testphenotypefile, testfile, bgenix_prefix, chrx_files, analysis_group, prsmap, cv_num, adjust_parameters.prs_file);
+        return GetPRSstats(testphenotypefile, testfile, bgenix_prefix, chrx_files, analysis_group, prsmap, adjust_parameters.prs_file)[0];
     }
     else{
         return vector<double>(4, 0);
     }
-}
-
-
-// print statistics for PRS, either from analysis weights and bgen file, or from prs doses
-
-void PrintPRSstats(const string& testphenotypefile, const vector<string>& testfile, const string& bgenix_prefix, const vector<string>& chrx_files, const string& analysis_group, const string& prs_file, int cv_num){
-
-    map<Posclass, vector<double>> prsmap;
-
-    zifstream prs_input(prs_file);
-
-    string rsnum;
-
-    Posclass posclass;
-
-    double oddsratio, eaf;
-
-    // ismapfile determines whether the file is just dosages when the number of columns will be one
-
-    bool ismapfile = [&]{
-        zifstream input(prs_file);
-        SplitString splitstr;
-        input >> splitstr;
-        return splitstr.size() != 1;
-    }();
-
-    vector<double> prs;
-
-    if(ismapfile){
-        while(prs_input >> rsnum >> posclass >> oddsratio >> eaf){
-
-            prsmap[posclass] = {oddsratio, eaf};
-        }
-    }
-    else{
-        vector<string> prs_str = FileReadH<vector<string>>(prs_file);
-
-        prs.resize(prs_str.size());
-
-        forc(i, prs_str){
-            try {
-                prs[i] = stod(prs_str[i]);
-            } catch (...) {
-                prs[i] = 0;
-            }
-        }
-    }
-
-    auto prsstats = GetPRSstats(testphenotypefile, testfile, bgenix_prefix, chrx_files, analysis_group, prsmap, cv_num, "", prs);
-
-    Printtabline(cout, prsstats[0], prsstats[1], prsstats[2], prsstats[3], prsstats[4], prsstats[0]*prsstats[4], (prsstats[0]-1.96*prsstats[1])*prsstats[4], (prsstats[0]+1.96*prsstats[1])*prsstats[4]);
-}
-
-
-map<Posclass, vector<double>> GeneratePRSmap(const string& inputfile)
-{
-    SplitString splitstr;
-
-    zifstream input(inputfile);
-
-    map<Posclass, vector<double>> result;
-
-    while(input >> splitstr){
-        result[Posclass(splitstr[1]=="X"?23:stoi(splitstr[1]), stoi(splitstr[2]), splitstr[3], splitstr[4])] = {stod(splitstr[5]), stod(splitstr[6])};
-    }
-
-    return result;
 }
 
 
@@ -3217,9 +3080,11 @@ int CL_mcmc_runs(int argc, char* argv[])
 
     double a, b, phi;
 
+    double k = 1.0;
+
     double inflation = 1;
 
-    int n_tests = 2000, c=5;
+    int n_tests = 2000;
 
     string analysis_group;
 
@@ -3245,7 +3110,7 @@ int CL_mcmc_runs(int argc, char* argv[])
 
     double nvalue = 0;
 
-    double max_phi = 1.0e10;
+    double max_phi = 1.0e50;
 
     double region_significance = 1e-200;
 
@@ -3269,17 +3134,36 @@ int CL_mcmc_runs(int argc, char* argv[])
 
     vector<double> approximation_threshold{-1.0,-1.0};
 
+    vector<double> bounds;
+
+    string method = "horseshoe";
+
+    double min_psi = 0.0;
+
+    vector<double> pvec, wvec;
+
+    double regvalue = 0.0;
+
+    int n_burnin = 1000;
+
+    bool use_ss_r2 = false;
+
+    double eaf_power = 1.0;
+
+    double r2_power = 1.0;
+
+    bool functional_scores = false;
 
     try
     {
         po::options_description desc;                           // this is a boost class that handles command line parameters
 
         desc.add_options()("help,h", "produce help message")
-                (",a", po::value<double>(&a)->required(), " a value")
-                (",b", po::value<double>(&b)->required(), "b value")
-                (",c", po::value<int>(&c), "number of cv groups")
+                (",a", po::value<double>(&a), " a value")
+                (",b", po::value<double>(&b), "b value")
                 (",g", po::value<string>(&analysis_group), "analysis group")
-                (",p", po::value<double>(&phi)->required(), "phi value")
+                (",p", po::value<double>(&phi), "phi value")
+                ("burnin,",po::value<int>(&n_burnin), "Number of burnin runs")
                 (",n", po::value<int>(&n_tests), "number of recorded runs")
                 (",i", po::value<string>(&inputfile), "input file prefix")
                 (",o", po::value<string>(&outputfile)->required(), "output file")
@@ -3306,7 +3190,19 @@ int CL_mcmc_runs(int argc, char* argv[])
                 (",x", po::value<vector<string>>(&chrx_files)->multitoken(), "files used to calibrate individuals if chromosome X files used")
                 ("seed,", po::value<int>(&seed), "seed to initialise random number generate, default is a computer generated seed")
                 ("runthreshold,", po::value<int>(&threshold_to_increase_runs), "if number of snps in a group is below this threshold then increase runs as less computationally expensive")
-                ("approx,", po::value<vector<double>>(&approximation_threshold)->multitoken(), "values for approximation in MCMC calculation (default no approximation)");
+                ("approx,", po::value<vector<double>>(&approximation_threshold)->multitoken(), "values for approximation in MCMC calculation (default no approximation)")
+                ("psibounds,", po::value<vector<double>>(&bounds)->multitoken(), "Psi bounds for different zscores")
+                ("method,", po::value<string>(&method), "Method for shrinkage (default horseshoe)")
+                (",k", po::value<double>(&k), "Second shape parameter if using generalised gamma (default = 1)")
+                ("minpsi,", po::value<double>(&k), "minimum psi (check if this reduces variance of MCMC sampling")
+                ("pvec,", po::value<vector<double>>(&pvec)->multitoken(), "p values for correlated phenotypes if used")
+                ("wvec,", po::value<vector<double>>(&wvec)->multitoken(), "w values for correlated phenotypes if used")
+                ("reg,", po::value<double>(&regvalue), "regularisation factor for horseshoe model")
+                ("ssr2,", po::value<bool>(&use_ss_r2)->zero_tokens(), "Use the estimated summary statistics r2")
+                ("eafpower,", po::value<double>(&eaf_power), "the exponent for how the variance is larger for rarer SNPs")
+                ("r2power,", po::value<double>(&r2_power), "the exponent for how a more accurate r2 increase the variance in the horseshoe model")
+                ("functional,", po::value<bool>(&functional_scores)->zero_tokens(), "use functional scores");
+
         po::variables_map vm;
 
         po::store(parse_command_line(argc, argv, desc), vm);
@@ -3333,38 +3229,16 @@ int CL_mcmc_runs(int argc, char* argv[])
         approximation_threshold.push_back(-1.0);
     }
 
-    MCMC_parameters mcmc_parameters{n_tests+1000, 1000, 1, a, b, phi, inflation, max_phi, region_significance, region_factor, region_distance, sparse, int(eaf_variance), zdiff, threshold_to_increase_runs, approximation_threshold};
+    if(bounds.empty() && max_phi < 1.0e10) bounds.push_back(max_phi);
+
+    MCMC_parameters mcmc_parameters{n_tests+n_burnin, n_burnin, 1, a, b, phi, inflation, max_phi, region_significance, region_factor, region_distance, sparse, int(eaf_variance), zdiff, threshold_to_increase_runs, approximation_threshold, bounds, method, pvec, wvec, k, min_psi, regvalue, use_ss_r2, eaf_power, r2_power, functional_scores};
 
     Adjust_parameters adjust_parameters{correctvalue, nvalue, weights_file, prs_file, chrX_weights_file, genmapprefix, uncorrdist, corr_damp, seed};
 
-    if(c!=1){
-        forl(i, c){
-            auto prsstats = GeneralPRSscores(Paste(inputfile, i,".txt"), i, reference_file_prefix, mcmc_parameters, adjust_parameters, analysis_group, "", {}, "", {}, testphenotypefile);
+    auto prsstats = GeneralPRSscores(inputfile, reference_file_prefix, mcmc_parameters, adjust_parameters, analysis_group, outputfile, testfile, bgenix_prefix, chrx_files, testphenotypefile);
 
-            forc(i, prsstats){
-
-                prsstats_sum[i] += prsstats[i];
-            }
-
-            prsstats_sum[5] += prsstats[0]*prsstats[4];
-
-            prsstats_sum[6] += (prsstats[0]-1.96*prsstats[1])*prsstats[4];
-
-            prsstats_sum[7] += (prsstats[0]+1.96*prsstats[1])*prsstats[4];
-
-            Printtabline(cout, i+1, prsstats[2], prsstats[3], prsstats_sum[2]/(i+1), prsstats_sum[3]/(i+1));
-        }
-
-        zofstream output(outputfile);
-
-        Printtabline(output, a, b, phi, prsstats_sum[0]/c, prsstats_sum[1]/c, prsstats_sum[2]/c, prsstats_sum[3]/c, prsstats_sum[4]/c, prsstats_sum[5]/c, prsstats_sum[6]/c, prsstats_sum[7]/c);
-    }
-    else{
-        auto prsstats = GeneralPRSscores(inputfile, -1, reference_file_prefix, mcmc_parameters, adjust_parameters, analysis_group, outputfile, testfile, bgenix_prefix, chrx_files, testphenotypefile);
-
-        if(!testfile.empty() || chrx_files.size()==2){
-            Printtabline(cout, a, b, phi, prsstats[0], prsstats[1], prsstats[2], prsstats[3], prsstats[4], prsstats[0]*prsstats[4], (prsstats[0]-1.96*prsstats[1])*prsstats[4], (prsstats[0]+1.96*prsstats[1])*prsstats[4]);
-        }
+    if(!testfile.empty() || chrx_files.size()==2){
+        Printtabline(cout, a, b, phi, prsstats[0], prsstats[1], prsstats[2], prsstats[3], prsstats[4], prsstats[0]*prsstats[4], (prsstats[0]-1.96*prsstats[1])*prsstats[4], (prsstats[0]+1.96*prsstats[1])*prsstats[4]);
     }
 
     return 0;
@@ -3454,32 +3328,11 @@ int CL_stepwise_runs(int argc, char* argv[])
 
     Adjust_parameters adjust_parameters{correctvalue, nvalue, weights_file};
 
-    if(c!=1){
-        forl(i, c){
-            auto prsstats = GeneralPRSscores(Paste(inputfile, i,".txt"), i, reference_file_prefix, threshold, adjust_parameters, analysis_group, "", {}, "", {}, testphenotypefile);
+//    auto prsstats = GeneralPRSscores(inputfile, reference_file_prefix, threshold, adjust_parameters, analysis_group, outputfile, testfile, bgenix_prefix, chrx_files, testphenotypefile);
 
-            effect_sum += prsstats[0];
-
-            se_sum += prsstats[1];
-
-            prschi2sum += prsstats[2];
-
-            auc_sum += prsstats[3];
-
-            Printtabline(cout, i+1, prsstats[2], prsstats[3], prschi2sum/(i+1), auc_sum/(i+1));
-        }
-
-        zofstream output(outputfile);
-
-        Printtabline(output, threshold, effect_sum/5, se_sum/5, prschi2sum/5, auc_sum/5);
-    }
-    else{
-        auto prsstats = GeneralPRSscores(inputfile, -1, reference_file_prefix, threshold, adjust_parameters, analysis_group, outputfile, testfile, bgenix_prefix, chrx_files, testphenotypefile);
-
-        if(!testfile.empty() || chrx_files.size()==2){
-            Printtabline(cout, threshold, prsstats[0], prsstats[1], prsstats[2], prsstats[3]);
-        }
-    }
+//    if(!testfile.empty() || chrx_files.size()==2){
+//        Printtabline(cout, threshold, prsstats[0], prsstats[1], prsstats[2], prsstats[3]);
+//    }
 
     return 0;
 }
@@ -3501,7 +3354,7 @@ int CL_PRSstats(int argc, char* argv[])
 
     string testphenotypefile = "";
 
-    string prs_file;
+    vector<string> prs_file;
 
     try
     {
@@ -3511,7 +3364,7 @@ int CL_PRSstats(int argc, char* argv[])
                 (",g", po::value<string>(&analysis_group), "analysis group")
                 (",f", po::value<vector<string>>(&testfile)->multitoken(), "test file for checking PRS score")
                 (",i", po::value<string>(&bgenix_prefix), "reference files")
-                (",w", po::value<string>(&prs_file), "weights for prs")
+                (",w", po::value<vector<string>>(&prs_file)->multitoken(), "weights for prs")
                 ("pheno,", po::value<string>(&testphenotypefile), "phenotype file for testing")
                 (",x", po::value<vector<string>>(&chrx_files)->multitoken());
 
@@ -3558,6 +3411,20 @@ int CL_PRSgenerate(int argc, char* argv[])
 
     vector<string> chrx_files;
 
+    string group_file;
+
+    bool dragen = false;
+
+    int chromosome = 0;
+
+    bool use_positions = false;
+
+    bool leading_zero = false;
+
+    bool leading_chr = false;
+
+    bool numeric_x = false;
+
     try
     {
         po::options_description desc;
@@ -3567,7 +3434,14 @@ int CL_PRSgenerate(int argc, char* argv[])
                 (",w", po::value<string>(&prs_file), "weights for prs")
                 (",r", po::value<string>(&bgenix_prefix), "reference files created by bgenix list")
                 (",o", po::value<string>(&outputfile), "output file containing prs weights")
-                (",x", po::value<vector<string>>(&chrx_files)->multitoken(), "files to calibrate individuals if chromosome X files used");
+                (",x", po::value<vector<string>>(&chrx_files)->multitoken(), "files to calibrate individuals if chromosome X files used")
+                (",g", po::value<string>(&group_file), "group file to average missing values (only needed for possible missingness)")
+                ("dragen,", po::value<bool>(&dragen)->zero_tokens(), "get id names from dragen naming convention")
+                (",c", po::value<int>(&chromosome), "assume chromosome of data file")
+                ("pos,p", po::value<bool>(&use_positions)->zero_tokens(), "use positions rather than ids")
+                ("leadzero,", po::value<bool>(&leading_zero)->zero_tokens(), "when using positions assume 1 is 01 etc (used in biobank)")
+                ("leadchr,", po::value<bool>(&leading_chr)->zero_tokens(), "when using positions assume 1 is chr1 etc")
+                ("numx,", po::value<bool>(&numeric_x)->zero_tokens(), "when using positions assume X is coded as 23");
 
         po::variables_map vm;
 
@@ -3591,21 +3465,49 @@ int CL_PRSgenerate(int argc, char* argv[])
 
     auto prsmap = GeneratePRSmap(prs_file);
 
-    auto value = GetPrincipalComponentValuesFromSeveralBgenFiles(data_files, prsmap, bgenix_prefix, chrx_files, 100);
+    bool multipgs = !prsmap.empty() && prsmap.begin()->second.size() > 2;
 
-    cout << "Created prs values\n";
+    if(multipgs){
+        auto value = GetMultiplePrincipalComponentValuesFromSeveralBgenFiles(data_files, prsmap, bgenix_prefix, chrx_files, 100);
 
-    zofstream output(outputfile);
+        cout << "Created prs values\n";
 
-    output << "prs\n";
+        zofstream output(outputfile);
 
-    forc(i, value){
-        output << value[i] << '\n';
+        forl(i, value.rows()){
+            if(i) output << '\t';
+
+            output << "pgs" << i+1;
+        }
+
+        output << '\n';
+
+        forl(i, value.cols()){
+            forl(j, value.rows()){
+                if(j) output << '\t';
+
+                output << value(j,i);
+            }
+
+            output << '\n';
+        }
+    }
+    else{
+        auto value = GetPrincipalComponentValuesFromSeveralBgenFiles(data_files, prsmap, {100, group_file, dragen, use_positions, leading_zero, leading_chr, numeric_x, chromosome}, bgenix_prefix, chrx_files);
+
+        cout << "Created prs values\n";
+
+        zofstream output(outputfile);
+
+        output << "prs\n";
+
+        forc(i, value){
+            output << value[i] << '\n';
+        }
     }
 
     return 0;
 }
-
 
 
 // CL_GenerateIds generates ids for the S4 selected SNPs by using bgenix files
@@ -3700,156 +3602,6 @@ void CompareReads()
             }
         }
     }
-}
-
-
-struct SumStatsPRS{
-    string rsnum;
-    Posclass posclass;
-    double genetic_position;
-    double w;   // weights from PRS weights file
-    double b;   // summary statistics coefficient estimate
-    double s;   // summary statistics standard error estimate
-    VectorXd ref_dosages; // reference dosages for SNP
-};
-
-// Get SNP statisitics of snps that are in the reference file
-// Column 2 chromosome
-// Column 3 position
-// Column 4 baseline
-// Column 5 effect
-// Column 8 odds ratio
-// Column 9 standard error
-
-vector<SumStatsPRS> GetSelectedSNPstatistics(const map<Posclass, vector<double>>& prsmap, const map<Posclass, long>& position_map, const string& summarystats_file, const string& ref_file, const string& include_file, const string& geneticmap_file)
-{
-    vector<SumStatsPRS> results;
-
-    BgenParser bgenParser(ref_file);
-
-    vector<int> include;
-
-    if(include_file != ""){
-        include = FileRead<vector<int>>(include_file);
-    }
-
-    string origsnpstr, snpstr;
-    SplitString splitstr;
-
-    Imputeclass imputeclass;
-
-    struct FlipCheck{
-        string ref;
-        string alt;
-    };
-
-    auto genmap = ReadGeneticMap(geneticmap_file);
-
-    zifstream input(summarystats_file);
-
-    while(input >> splitstr){
-        try {
-            Posclass posclass(ConvertChrStr(splitstr[1]), stoi(splitstr[2]), splitstr[4], splitstr[3]);
-
-            if(auto itor = prsmap.find(posclass);itor!=prsmap.end()){     // snp found in map
-                if(auto itor2 = position_map.find(posclass);itor2!=position_map.end()){
-
-                    bgenParser.JumpToPosition(itor2->second);
-
-                    if(include_file != ""){
-                        bgenParser.ReadImputeclass(imputeclass, include);
-                    }
-                    else{
-                        bgenParser.ReadAllImputeclass(imputeclass);
-                    }
-
-                    if(isfinite(imputeclass.r2) && imputeclass.r2 > 0){
-                        int flip = MatchAlleles(imputeclass, FlipCheck{posclass.ref, posclass.alt});    // are the alleles in the same order as the test statistics
-
-                        double mean = 2.0*imputeclass.eaf;
-
-                        try{
-                            double bvalue = flip * stod(splitstr[7]);
-
-                            double svalue = stod(splitstr[8]);
-
-                            if(isfinite(bvalue) && isfinite(svalue) && svalue>0){
-                                results.push_back(SumStatsPRS());
-
-                                results.back().w = itor->second[0];
-
-                                results.back().posclass = posclass;
-
-                                results.back().b = bvalue;
-
-                                results.back().s = svalue;
-
-                                results.back().genetic_position = CalcGeneticPosition(genmap, posclass.position);
-
-                                results.back().ref_dosages = VectorXd::Zero(imputeclass.size());
-
-                                forc(i, imputeclass){
-                                    if(imputeclass[i]>-0.5){
-                                        results.back().ref_dosages[i] = imputeclass[i] - mean;
-                                    }
-                                    else{
-                                        results.back().ref_dosages[i]=0;
-                                    }
-                                }
-
-                                results.back().ref_dosages = results.back().ref_dosages/results.back().ref_dosages.norm();
-
-                                int flip2 = MatchAlleles(imputeclass, FlipCheck{itor->first.ref, itor->first.alt});
-
-                                if(flip2 == -1){
-                                    results.back().w *= -1;
-                                }
-                            }
-                        }
-                        catch(...){
-                        }
-                    }
-                }
-            }
-        } catch (...) {
-
-        }
-    }
-
-    return results;
-}
-
-
-map<Posclass, long> GetPositionsFromIds(vector<string> rsids, const string& ref_file)
-{
-    BgenParser bgenParser(ref_file);
-
-    genfile::bgen::SqliteIndexQuery query(ref_file +".bgi");
-
-    query.include_rsids(rsids);
-
-    query.initialise();
-
-    map<Posclass, long> result;
-
-    for(size_t i=0;i<query.number_of_variants();i++){
-
-        auto fileposition = query.locate_variant(i);
-
-        bgenParser.JumpToPosition(fileposition.first);
-
-        std::string chromosome ;
-        uint32_t position ;
-        std::string rsid ;
-        std::vector< std::string > alleles ;
-        std::vector< std::vector< double > > probs ;
-
-        bgenParser.read_variant( &chromosome, &position, &rsid, &alleles );
-
-        result[Posclass(ConvertChrStr(chromosome), position, alleles[0], alleles[1])] = fileposition.first;
-    }
-
-    return result;
 }
 
 
@@ -3980,7 +3732,7 @@ void EstimatePRSaccuracyFromSummaryStatistics(const string &summarystats_file, c
     forc(i, b){
         b[i] = summary_stats[i].b;
         s[i] = summary_stats[i].s;
-        w[i] = summary_stats[i].w;
+        w[i] = summary_stats[i].w[0];
 
         if(!isfinite(s[i])){
             cout << summary_stats[i].rsnum << ' ' << summary_stats[i].posclass << '\n';
@@ -4051,6 +3803,186 @@ int CL_SummaryStatisticsPRSstats(int argc, char* argv[])
     }
 
     EstimatePRSaccuracyFromSummaryStatistics(summarystats_file, bgenix_reffile, bgen_ref_file, prs_file, include_file, geneticmap_file, {genetic_dist, corr_damp});
+
+    return 0;
+}
+
+
+int CL_CalcSNPcontributions(int argc, char* argv[])
+{
+    string bgenix_reffile_prefix;
+
+    string bgen_ref_file_prefix;
+
+    string pgm_file;
+
+    string include_file;
+
+    string geneticmap_file;
+
+    double genetic_dist;
+
+    try
+    {
+        po::options_description desc;
+
+        desc.add_options()("help,h", "produce help message")
+                (",b", po::value<string>(&bgen_ref_file_prefix), "bgen reference data file")
+                (",r", po::value<string>(&bgenix_reffile_prefix), "reference files created by bgenix list")
+                (",w", po::value<string>(&pgm_file), "weights for pgm")
+                (",i", po::value<string>(&include_file), "include file")
+                ("genmapfile,", po::value<string>(&geneticmap_file), "genetic map file")
+                ("dist,", po::value<double>(&genetic_dist), "max distance to consider being in same correlated group");
+
+
+        po::variables_map vm;
+
+        po::store(parse_command_line(argc, argv, desc), vm);
+
+        if (vm.count("help"))
+        {
+            cout << desc;
+
+            return 1;
+        }
+
+        notify(vm);
+    }
+    catch (const po::error& e)
+    {
+        cout << e.what() << '\n';
+
+        return -1;
+    }
+
+    CalcSNPcontributions(pgm_file, bgenix_reffile_prefix, bgen_ref_file_prefix, include_file, geneticmap_file, genetic_dist);
+
+    return 0;
+}
+
+
+int CL_MultiPGSsumstats(int argc, char* argv[])
+{
+    string summarystats_file;
+
+    string bgenix_reffile;
+
+    string bgen_ref_file;
+
+    vector<string> pgm_files;
+
+    string include_file;
+
+    string chrX_include_file;
+
+    string geneticmap_file;
+
+    string corr_file_prefix = "";
+
+    double genetic_dist = 3.0;
+
+    try
+    {
+        po::options_description desc;
+
+        desc.add_options()("help,h", "produce help message")
+                (",s", po::value<string>(&summarystats_file)->required(), "summary statistics file for phenotype of interest")
+                (",b", po::value<string>(&bgen_ref_file), "bgen reference data file")
+                (",r", po::value<string>(&bgenix_reffile), "reference files created by bgenix list")
+                (",w", po::value<vector<string>>(&pgm_files)->multitoken()->required(), "weights for polygenic models")
+                (",i", po::value<string>(&include_file), "include file")
+                ("i2,", po::value<string>(&chrX_include_file), "include file for chromosome X (only specify if different from main include file)")
+                ("genmapfile,", po::value<string>(&geneticmap_file), "genetic map file")
+                ("dist,", po::value<double>(&genetic_dist), "max distance to consider being in same correlated group")
+                ("corr,c", po::value<string>(&corr_file_prefix), "correlation file");
+
+
+        po::variables_map vm;
+
+        po::store(parse_command_line(argc, argv, desc), vm);
+
+        if (vm.count("help"))
+        {
+            cout << desc;
+
+            return 1;
+        }
+
+        notify(vm);
+    }
+    catch (const po::error& e)
+    {
+        cout << e.what() << '\n';
+
+        return -1;
+    }
+
+    if(corr_file_prefix!=""){
+        MultiPGSregressionFromCorrelationFiles(summarystats_file, pgm_files, corr_file_prefix);
+    }
+    else{
+        MultiPGSregression(summarystats_file, pgm_files, bgenix_reffile, bgen_ref_file, include_file, chrX_include_file, geneticmap_file, genetic_dist);
+    }
+
+    return 0;
+}
+
+
+int CL_CorrelationMatrix(int argc, char* argv[])
+{
+    string summarystats_file;
+
+    string bgenix_reffile;
+
+    string bgen_ref_file;
+
+    vector<string> pgm_files;
+
+    string include_file;
+
+    string chrX_include_file;
+
+    string geneticmap_file;
+
+    string output_file;
+
+    double genetic_dist = 3.0;
+
+    try
+    {
+        po::options_description desc;
+
+        desc.add_options()("help,h", "produce help message")
+                (",b", po::value<string>(&bgen_ref_file), "bgen reference data file")
+                (",r", po::value<string>(&bgenix_reffile), "reference files created by bgenix list")
+                (",w", po::value<vector<string>>(&pgm_files)->multitoken(), "weights for polygenic models")
+                (",i", po::value<string>(&include_file), "include file")
+                ("genmapfile,", po::value<string>(&geneticmap_file), "genetic map file")
+                ("dist,", po::value<double>(&genetic_dist), "max distance to consider being in same correlated group")
+                (",o", po::value<string>(&output_file), "output file containing correlations");
+
+
+        po::variables_map vm;
+
+        po::store(parse_command_line(argc, argv, desc), vm);
+
+        if (vm.count("help"))
+        {
+            cout << desc;
+
+            return 1;
+        }
+
+        notify(vm);
+    }
+    catch (const po::error& e)
+    {
+        cout << e.what() << '\n';
+
+        return -1;
+    }
+
+    PrintCorrelationMatrix(bgenix_reffile, bgen_ref_file, pgm_files, include_file, geneticmap_file, genetic_dist, output_file);
 
     return 0;
 }
@@ -4152,13 +4084,19 @@ int main(int argc, char* argv[])
 
     return CL_CondAnalysis(argc, argv);
 
-//    return CL_SparseCondAnalysis(argc, argv);
-
 //    return CL_bfdp_runs(argc, argv);
 
 //    return CL_mcmc_runs(argc, argv);
 
+//    return CL_SelectedLS(argc, argv);
+
 //    return CL_PRSstats(argc, argv);
+
+//    return CL_CalcSNPcontributions(argc, argv);
+
+//    return CL_MultiPGSsumstats(argc, argv);
+
+//    return CL_CorrelationMatrix(argc, argv);
 
 //    return CL_PRSgenerate(argc, argv);
 

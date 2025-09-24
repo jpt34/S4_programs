@@ -14,6 +14,6 @@ if(${CMAKE_BUILD_TYPE} STREQUAL "Release")
   SET(CMAKE_EXE_LINKER_FLAGS "-static")
 endif()
 
-add_executable(S4_programs main.cpp Mlogit.cpp bgen/IndexQuery.cpp bgen/MissingValue.cpp bgen/View.cpp bgen/bgen.cpp bgen/ImputeclassDetailed.cpp bgen/db/Connection.cpp bgen/db/Error.cpp bgen/db/SQLStatement.cpp bgen/db/SQLite3Connection.cpp bgen/db/SQLite3Statement.cpp routines.cpp)
+add_executable(S4_programs main.cpp Mlogit.cpp bgen/IndexQuery.cpp bgen/MissingValue.cpp bgen/View.cpp bgen/bgen.cpp bgen/ImputeclassDetailed.cpp bgen/db/Connection.cpp bgen/db/Error.cpp bgen/db/SQLStatement.cpp bgen/db/SQLite3Connection.cpp bgen/db/SQLite3Statement.cpp routines.cpp SNPcontributions.cpp MultiPGS.cpp PGSregression.cpp LowSignificanceCorrection.cpp)
 
-target_link_libraries(S4_programs -lboost_program_options -lboost_iostreams -lz -lzstd -lboost_system -lboost_filesystem -lboost_thread -pthread /home/jpt34/ExternalLibrary/libboost.a -lrt -lsqlite3 -dynamic -ldl)
+target_link_libraries(S4_programs -lboost_program_options -lboost_iostreams -lz -lzstd -lboost_system -lboost_filesystem -lboost_thread -pthread /home/jpt34/ExternalLibrary/libboost.a -lrt -lsqlite3 -ldl)
